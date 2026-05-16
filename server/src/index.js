@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-require('dotenv').config();
+require('dotenv').config({ override: true });
 
 const app = express();
 app.use(cors());
@@ -12,36 +12,56 @@ app.get('/api/youtube/search', async (req, res) => {
   const query = req.query.q;
   const apiKey = process.env.YOUTUBE_API_KEY;
   if (!query) return res.status(400).json({ error: 'Falta q' });
+  console.log(`🔍 BUSQUEDA YOUTUBE: "${query}"`);
   try {
     const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=6&type=video&q=${encodeURIComponent(query)}&key=${apiKey}`;
     const response = await fetch(url);
     const data = await response.json();
+    
+    if (data.error) {
+      console.error("❌ ERROR API YOUTUBE:", data.error.message);
+      return res.status(500).json({ error: data.error.message });
+    }
+
     const results = data.items?.map(item => ({
       id: item.id.videoId,
       titulo: item.snippet.title,
       miniatura: item.snippet.thumbnails.high.url
     })) || [];
+
+    console.log(`✅ RESULTADOS ENCONTRADOS: ${results.length}`);
     res.json(results);
   } catch (error) {
-    res.status(500).json({ error: 'Error' });
+    console.error("❌ ERROR EN EL SERVIDOR (SEARCH):", error);
+    res.status(500).json({ error: 'Error interno' });
   }
 });
 
 app.get('/api/youtube/recommendations', async (req, res) => {
   const query = req.query.q || 'music';
   const apiKey = process.env.YOUTUBE_API_KEY;
+  console.log(`🔍 RECOMENDACIONES YOUTUBE: "${query}"`);
   try {
     const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=16&type=video&q=${encodeURIComponent(query)}&key=${apiKey}`;
     const response = await fetch(url);
     const data = await response.json();
+
+    if (data.error) {
+      console.error("❌ ERROR API YOUTUBE (REC):", data.error.message);
+      return res.status(500).json({ error: data.error.message });
+    }
+
     const results = data.items?.map(item => ({
       id: item.id.videoId,
       titulo: item.snippet.title,
       miniatura: item.snippet.thumbnails.high.url
     })) || [];
+
+    console.log(`✅ RECOMENDACIONES ENCONTRADAS: ${results.length}`);
     res.json(results);
   } catch (error) {
-    res.status(500).json({ error: 'Error' });
+    console.error("❌ ERROR EN EL SERVIDOR (REC):", error);
+    res.status(500).json({ error: 'Error interno' });
   }
 });
 

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Search, X, Loader2, Play } from 'lucide-react';
 import socket from '../../config/socket';
+import { API_BASE_URL } from '../../config/config';
 
 const CreateRoomModal = ({ user, onClose, onCreateSuccess }) => {
   const [query, setQuery] = useState('');
@@ -13,7 +14,7 @@ const CreateRoomModal = ({ user, onClose, onCreateSuccess }) => {
 
     setLoading(true);
     try {
-      const response = await fetch(`http://localhost:4000/api/youtube/search?q=${encodeURIComponent(query)}`);
+      const response = await fetch(`${API_BASE_URL}/api/youtube/search?q=${encodeURIComponent(query)}`);
       const data = await response.json();
       setResults(data);
     } catch (error) {

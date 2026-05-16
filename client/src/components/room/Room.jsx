@@ -1,7 +1,8 @@
 import React, { useEffect, useState, useRef } from 'react';
 import YouTube from 'react-youtube';
 import socket from '../../config/socket';
-import { Send, ChevronLeft, Users, MessageSquare, Lock, Loader2, Volume2, Smile } from 'lucide-react';
+import { API_BASE_URL } from '../../config/config';
+import { Send, ChevronLeft, Users, MessageSquare, Lock, Loader2, Volume2, Smile, Search, X } from 'lucide-react';
 
 const Room = ({ roomId, user, onLeave }) => {
   const [roomData, setRoomData] = useState(null);
@@ -14,6 +15,8 @@ const Room = ({ roomId, user, onLeave }) => {
   const [reactions, setReactions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [suggestions, setSuggestions] = useState([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [isSearching, setIsSearching] = useState(false);
   const [activeReactionMenuId, setActiveReactionMenuId] = useState(null);
   const [typingUsers, setTypingUsers] = useState([]);
   
@@ -192,7 +195,7 @@ const Room = ({ roomId, user, onLeave }) => {
     if (event.data === 0) {
       setShowSuggestions(true);
       const title = event.target.getVideoData().title || 'music';
-      fetch(`http://localhost:4000/api/youtube/recommendations?q=${encodeURIComponent(title)}`)
+      fetch(`${API_BASE_URL}/api/youtube/recommendations?q=${encodeURIComponent(title)}`)
         .then(res => res.json())
         .then(data => setSuggestions(data))
         .catch(e => console.warn(e));
@@ -219,6 +222,21 @@ const Room = ({ roomId, user, onLeave }) => {
         state,
         currentTime: event.target.getCurrentTime()
       });
+    }
+  };
+
+  const handleManualSearch = async (e) => {
+    e.preventDefault();
+    if (!searchQuery.trim()) return;
+    setIsSearching(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/youtube/search?q=${encodeURIComponent(searchQuery)}`);
+      const data = await response.json();
+      setSuggestions(data);
+    } catch (error) {
+      console.error("Error buscando:", error);
+    } finally {
+      setIsSearching(false);
     }
   };
 
@@ -287,10 +305,27 @@ const Room = ({ roomId, user, onLeave }) => {
         
         {/* Header compacto para móvil / Header normal para desktop */}
         <div className="flex items-center justify-between p-4 md:p-0 md:mb-4 shrink-0 bg-dark-900/50 md:bg-transparent backdrop-blur-md md:backdrop-blur-none border-b border-white/5 md:border-none">
-          <button onClick={() => setShowExitConfirm(true)} className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors group">
-            <ChevronLeft className="w-5 h-5 group-hover:-translate-x-1 transition-transform" />
-            <span className="font-bold hidden sm:inline text-sm">Lobby</span>
-          </button>
+          <div className="flex items-center gap-3">
+            <button onClick={() => setShowExitConfirm(true)} className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors group">
+              <ChevronLeft className="w-5 h-5 group-hover:-translate-x-1 transition-transform" />
+              <span className="font-bold hidden sm:inline text-sm">Lobby</span>
+            </button>
+            <button 
+              onClick={() => {
+                setShowSuggestions(!showSuggestions);
+                if (!showSuggestions && suggestions.length === 0) {
+                   const title = roomData?.video_actual?.titulo || 'music';
+                   fetch(`${API_BASE_URL}/api/youtube/recommendations?q=${encodeURIComponent(title)}`)
+                    .then(res => res.json())
+                    .then(data => setSuggestions(data));
+                }
+              }} 
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-xl transition-all font-bold text-xs uppercase tracking-widest ${showSuggestions ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+            >
+              <Search className="w-4 h-4" />
+              <span className="hidden lg:inline">Buscar Música</span>
+            </button>
+          </div>
           
           <div className="flex flex-col items-end text-right">
             <h1 className="text-sm md:text-lg font-black tracking-tight line-clamp-1 max-w-[150px] sm:max-w-xs md:max-w-xl">
@@ -362,14 +397,43 @@ const Room = ({ roomId, user, onLeave }) => {
 
           {/* OVERLAY WALL OF MUSIC */}
           {showSuggestions && (
-            <div className="absolute inset-0 bg-dark-900/95 backdrop-blur-md z-40 p-6 overflow-y-auto flex flex-col custom-scrollbar">
-              <h2 className="text-xl font-black uppercase tracking-wider mb-6 text-indigo-400 sticky top-0 bg-dark-900/90 py-2 z-10 border-b border-indigo-500/20">
-                Continuar la fiesta en Yale...
-              </h2>
+            <div className="absolute inset-0 bg-dark-900/95 backdrop-blur-md z-40 p-6 overflow-y-auto flex flex-col custom-scrollbar animate-in fade-in zoom-in-95 duration-200">
+              <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 sticky top-0 bg-dark-900/90 py-4 z-10 border-b border-white/10 gap-4">
+                <div>
+                  <h2 className="text-xl font-black uppercase tracking-wider text-indigo-400">
+                    {isHost ? "Cambiar la música" : "Siguientes sugerencias"}
+                  </h2>
+                  <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest mt-1">Busca cualquier video de YouTube</p>
+                </div>
+
+                {isHost && (
+                  <form onSubmit={handleManualSearch} className="flex-1 max-w-md relative group">
+                    <input 
+                      type="text" 
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Busca una canción..." 
+                      className="w-full bg-dark-800 border border-white/10 rounded-2xl py-2.5 pl-10 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-600 transition-all shadow-inner"
+                    />
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500 group-focus-within:text-indigo-400 transition-colors" />
+                    {isSearching && <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 animate-spin text-indigo-400" />}
+                  </form>
+                )}
+
+                <button 
+                  onClick={() => setShowSuggestions(false)}
+                  className="bg-white/5 hover:bg-white/10 p-2.5 rounded-2xl transition-all border border-white/5"
+                >
+                  <X className="w-5 h-5 text-gray-400" />
+                </button>
+              </div>
               
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4 pb-10">
-                {suggestions.length === 0 ? (
-                   <div className="col-span-full flex justify-center py-20"><Loader2 className="w-10 h-10 animate-spin text-indigo-500" /></div>
+                {(isSearching || suggestions.length === 0) ? (
+                   <div className="col-span-full flex flex-col items-center justify-center py-20 opacity-50">
+                      <Loader2 className="w-10 h-10 animate-spin text-indigo-500 mb-4" />
+                      <p className="text-xs font-black uppercase tracking-widest">{isSearching ? "Buscando..." : "Cargando sugerencias..."}</p>
+                   </div>
                 ) : (
                   suggestions.map((vid) => (
                     <div 
