@@ -77,7 +77,9 @@ app.get('/api/youtube/info/:videoId', async (req, res) => {
       dumpJson: true,
       noWarnings: true,
       quiet: true,
-      skipDownload: true
+      skipDownload: true,
+      extractorArgs: 'youtube:player_client=ios,android',
+      geoBypass: true
     });
 
     const info = typeof output === 'string' ? JSON.parse(output) : output;
@@ -107,7 +109,9 @@ const streamWithYtDlp = async (videoId, json, res) => {
       noWarnings: true,
       quiet: true,
       format: 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-      preferFreeFormats: true
+      preferFreeFormats: true,
+      extractorArgs: 'youtube:player_client=ios,android',
+      geoBypass: true
     });
 
     const info = typeof output === 'string' ? JSON.parse(output) : output;
