@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const { Readable } = require('stream');
 require('dotenv').config({ override: true });
 const YtDlpExec = require('yt-dlp-exec');
 
@@ -67,6 +68,35 @@ app.get('/api/youtube/recommendations', async (req, res) => {
   }
 });
 
+app.get('/api/youtube/info/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  console.log(`ℹ️ OBTENIENDO INFO YOUTUBE (yt-dlp): ${videoId}`);
+  try {
+    const output = await YtDlpExec(videoUrl, {
+      dumpJson: true,
+      noWarnings: true,
+      quiet: true,
+      skipDownload: true
+    });
+
+    const info = typeof output === 'string' ? JSON.parse(output) : output;
+    
+    // Obtener la mejor miniatura disponible
+    const miniatura = info.thumbnail 
+      || (info.thumbnails && info.thumbnails.length > 0 ? info.thumbnails[info.thumbnails.length - 1].url : null)
+      || `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
+
+    res.json({
+      titulo: info.title || `Video ${videoId}`,
+      miniatura: miniatura
+    });
+  } catch (error) {
+    console.error("❌ ERROR EN EL SERVIDOR (INFO):", error.message);
+    res.status(500).json({ error: 'Error obteniendo información del video', message: error.message });
+  }
+});
+
 const streamWithYtDlp = async (videoId, json, res) => {
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
   console.log(`↩️ Usando yt-dlp para generar stream: ${videoId}`);
@@ -116,7 +146,7 @@ const streamWithYtDlp = async (videoId, json, res) => {
 
     res.setHeader('Content-Type', response.headers.get('content-type') || contentType);
     res.setHeader('Access-Control-Allow-Origin', '*');
-    response.body.pipe(res);
+    Readable.fromWeb(response.body).pipe(res);
   } catch (err) {
     console.error('❌ yt-dlp stream error:', err.message);
     return res.status(500).json({ error: 'Fallback error', message: err.message });
