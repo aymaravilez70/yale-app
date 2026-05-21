@@ -3,10 +3,12 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 require('dotenv').config({ override: true });
+const { Innertube, Platform } = require('youtubei.js');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
 
 app.get('/api/youtube/search', async (req, res) => {
   const query = req.query.q;
@@ -62,6 +64,63 @@ app.get('/api/youtube/recommendations', async (req, res) => {
   } catch (error) {
     console.error("❌ ERROR EN EL SERVIDOR (REC):", error);
     res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+app.get('/api/youtube/stream', async (req, res) => {
+  const { videoId, json } = req.query;
+  if (!videoId) return res.status(400).json({ error: 'Falta videoId' });
+  
+  console.log(`🎬 OBTENIENDO STREAM YOUTUBE: ${videoId}`);
+  try {
+    const youtube = await Innertube.create({
+      cache: new (require('node-cache'))(),
+      generate_session_locally: true
+    });
+
+    const info = await youtube.getInfo(videoId);
+    
+    // Buscar formato de audio de buena calidad
+    const audioFormats = info.streaming_data?.adaptive_formats?.filter(f => 
+      f.audio_codec && !f.video_codec
+    ).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+    if (!audioFormats || audioFormats.length === 0) {
+      console.warn(`⚠️ No se encontraron formatos de audio para ${videoId}`);
+      return res.status(404).json({ error: 'No audio formats found' });
+    }
+
+    const format = audioFormats[0];
+    let streamUrl = format.url;
+
+    // Si el formato requiere deciframiento
+    if (format.cipher) {
+      streamUrl = await format.decipher(youtube.session.player);
+    }
+
+    console.log(`✅ STREAM OBTENIDO: ${streamUrl.substring(0, 80)}...`);
+
+    if (json === 'true') {
+      res.json({ streamUrl });
+    } else {
+      // Si no pide JSON, hacer proxy del stream
+      const response = await fetch(streamUrl, {
+        headers: {
+          'Referer': 'https://www.youtube.com/',
+          'Origin': 'https://www.youtube.com/',
+          'User-Agent': 'Mozilla/5.0'
+        }
+      });
+      
+      res.setHeader('Content-Type', response.headers.get('content-type') || 'audio/mp4');
+      res.setHeader('Content-Length', response.headers.get('content-length'));
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      
+      response.body.pipe(res);
+    }
+  } catch (error) {
+    console.error("❌ ERROR OBTENIENDO STREAM YOUTUBE:", error.message);
+    res.status(500).json({ error: 'Error interno', message: error.message });
   }
 });
 
