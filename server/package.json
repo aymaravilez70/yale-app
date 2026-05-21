@@ -17,6 +17,6 @@
     "express": "^5.2.1",
     "node-cache": "^5.1.2",
     "socket.io": "^4.8.3",
-    "youtubei.js": "^9.3.2"
+    "yt-dlp-exec": "^1.0.2"
   }
 }

@@ -1,0 +1,25 @@
+{
+  "cli": {
+    "version": ">= 3.0.0"
+  },
+  "build": {
+    "production": {
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://yale-app.onrender.com",
+        "EXPO_PUBLIC_SOCKET_URL": "https://yale-app.onrender.com"
+      }
+    },
+    "preview": {
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://yale-app.onrender.com",
+        "EXPO_PUBLIC_SOCKET_URL": "https://yale-app.onrender.com"
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# Exclude local build artifacts from the EAS archive
+android/build/
+android/app/build/
+android/app/.cxx/
+android/.cxx/
+android/.gradle/
+.expo/
+dist/
+node_modules/
+*.log
+
+# Ignore generated native artifacts and caches
+*.keystore
+*.p12
+*.jks

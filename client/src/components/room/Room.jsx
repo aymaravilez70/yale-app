@@ -41,7 +41,12 @@ const Room = ({ roomId, user, onLeave }) => {
     };
 
     const handleNewParticipant = (list) => setParticipants(list || []);
-    const handleMessage = (msg) => setMessages((prev) => [...prev, msg]);
+    const handleMessage = (msg) => {
+      setMessages((prev) => {
+        if (prev.some(m => m.id === msg.id)) return prev;
+        return [...prev, msg];
+      });
+    };
     
     const handleVideoUpdate = ({ state, currentTime }) => {
       // Actualizar el estado local para que el "Vigilante" sepa el estado real
@@ -75,6 +80,19 @@ const Room = ({ roomId, user, onLeave }) => {
       }
     };
 
+    const handleBrowserNavigation = ({ url }) => {
+      setRoomData(prev => {
+        if (!prev || !prev.video_actual) return prev;
+        return {
+          ...prev,
+          video_actual: {
+            ...prev.video_actual,
+            browserUrl: url
+          }
+        };
+      });
+    };
+
     socket.on('room-state', handleRoomState);
     socket.on('nuevo-participante', handleNewParticipant);
     socket.on('participante-salio', handleNewParticipant);
@@ -84,6 +102,7 @@ const Room = ({ roomId, user, onLeave }) => {
     socket.on('receive-message-reaction', ({ messageId, emoji }) => {
       setMessages(prev => prev.map(m => m.id === messageId ? { ...m, reactions: [...(m.reactions || []), emoji] } : m));
     });
+    socket.on('browser-navigation-update', handleBrowserNavigation);
 
     const handleTyping = (username) => {
       if (username !== user?.username) {
@@ -106,6 +125,7 @@ const Room = ({ roomId, user, onLeave }) => {
       socket.off('receive-message');
       socket.off('receive-reaction');
       socket.off('receive-message-reaction');
+      socket.off('browser-navigation-update', handleBrowserNavigation);
       socket.off('user-typing', handleTyping);
       socket.off('user-stop-typing', handleStopTyping);
     };
@@ -341,16 +361,25 @@ const Room = ({ roomId, user, onLeave }) => {
         {/* Contenedor del Reproductor */}
         <div className="relative aspect-video md:flex-1 md:rounded-3xl overflow-hidden bg-black shadow-2xl md:border border-white/5 group">
           {roomData?.video_actual?.id && (
-            <YouTube
-              videoId={roomData.video_actual.id}
-              opts={{
-                width: '100%', height: '100%',
-                playerVars: { autoplay: 1, controls: isHost ? 1 : 0, modestbranding: 1, rel: 0, showinfo: 0, iv_load_policy: 3, disablekb: isHost ? 0 : 1 }
-              }}
-              onReady={onPlayerReady}
-              onStateChange={onPlayerStateChange}
-              className="absolute inset-0 w-full h-full"
-            />
+            roomData.video_actual.id === 'browser_sync' ? (
+              <iframe
+                src={roomData.video_actual.browserUrl || 'https://duckduckgo.com'}
+                className="absolute inset-0 w-full h-full border-none bg-black"
+                allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
+                allowFullScreen
+              />
+            ) : (
+              <YouTube
+                videoId={roomData.video_actual.id}
+                opts={{
+                  width: '100%', height: '100%',
+                  playerVars: { autoplay: 1, controls: isHost ? 1 : 0, modestbranding: 1, rel: 0, showinfo: 0, iv_load_policy: 3, disablekb: isHost ? 0 : 1 }
+                }}
+                onReady={onPlayerReady}
+                onStateChange={onPlayerStateChange}
+                className="absolute inset-0 w-full h-full"
+              />
+            )
           )}
           
           <div className="absolute bottom-6 left-6 flex items-center gap-3 bg-dark-900/80 backdrop-blur-md p-2.5 px-3 rounded-2xl border border-white/10 group/volume transition-all hover:w-48 w-12 overflow-hidden shadow-2xl z-30 opacity-0 group-hover:opacity-100 duration-300">

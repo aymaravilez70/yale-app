@@ -3,7 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 require('dotenv').config({ override: true });
-const { Innertube, Platform } = require('youtubei.js');
+const YtDlpExec = require('yt-dlp-exec');
 
 const app = express();
 app.use(cors());
@@ -67,139 +67,68 @@ app.get('/api/youtube/recommendations', async (req, res) => {
   }
 });
 
+const streamWithYtDlp = async (videoId, json, res) => {
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  console.log(`↩️ Usando yt-dlp para generar stream: ${videoId}`);
+
+  try {
+    const output = await YtDlpExec(videoUrl, {
+      dumpJson: true,
+      noWarnings: true,
+      quiet: true,
+      format: 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      preferFreeFormats: true
+    });
+
+    const info = typeof output === 'string' ? JSON.parse(output) : output;
+    const progressive = (info.formats || [])
+      .filter(f => f.url && f.acodec && f.vcodec && f.acodec !== 'none' && f.vcodec !== 'none');
+
+    const chosen = progressive
+      .sort((a, b) => ((b.tbr || b.abr || 0) - (a.tbr || a.abr || 0)))[0]
+      || (info.formats || []).find(f => f.url && f.ext === 'mp4')
+      || info;
+
+    const streamUrl = chosen.url || info.url;
+    const contentType = chosen.ext
+      ? (chosen.vcodec && chosen.acodec ? `video/${chosen.ext}` : `audio/${chosen.ext}`)
+      : 'video/mp4';
+
+    if (!streamUrl) {
+      console.error(`❌ yt-dlp no devolvió URL de stream para ${videoId}`);
+      return res.status(500).json({ error: 'No se pudo obtener URL de audio' });
+    }
+
+    if (json === 'true') {
+      return res.json({ streamUrl, contentType });
+    }
+
+    const response = await fetch(streamUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'Referer': 'https://www.youtube.com/'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Stream proxy error: ${response.status}`);
+    }
+
+    res.setHeader('Content-Type', response.headers.get('content-type') || contentType);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    response.body.pipe(res);
+  } catch (err) {
+    console.error('❌ yt-dlp stream error:', err.message);
+    return res.status(500).json({ error: 'Fallback error', message: err.message });
+  }
+};
+
 app.get('/api/youtube/stream', async (req, res) => {
   const { videoId, json } = req.query;
   if (!videoId) return res.status(400).json({ error: 'Falta videoId' });
-  
-  console.log(`🎬 OBTENIENDO STREAM YOUTUBE: ${videoId}`);
-  try {
-    const youtube = await Innertube.create({
-      cache: new (require('node-cache'))(),
-      generate_session_locally: true
-    });
 
-    const info = await youtube.getInfo(videoId);
-    
-    // Debug: Log la estructura de streaming_data
-    console.log(`📊 Info del video:`, {
-      title: info.basic_info?.title,
-      videoDetails: !!info.basic_info,
-      hasStreamingData: !!info.streaming_data,
-    });
-
-    // Verificar si es un video válido
-    if (!info.basic_info?.title) {
-      console.warn(`⚠️ Video no encontrado o no es válido: ${videoId}`);
-      return res.status(404).json({ error: 'Video no encontrado' });
-    }
-
-    // Si no hay streaming_data, intentar obtener el mejor formato disponible
-    if (!info.streaming_data) {
-      console.warn(`⚠️ Sin streaming_data. Intentando obtener mejor formato disponible...`);
-      
-      // Intentar usar el método de descarga de youtube.js si está disponible
-      try {
-        const format = await youtube.chooseFormat({ quality: 'best[ext=mp4]', type: 'audio' });
-        if (format?.url) {
-          console.log(`✅ Formato obtenido vía alternativo`);
-          const streamUrl = format.url;
-          
-          if (json === 'true') {
-            return res.json({ streamUrl });
-          } else {
-            const response = await fetch(streamUrl, {
-              headers: {
-                'Referer': 'https://www.youtube.com/',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-              }
-            });
-            res.setHeader('Content-Type', response.headers.get('content-type') || 'audio/mp4');
-            res.setHeader('Content-Length', response.headers.get('content-length'));
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            response.body.pipe(res);
-            return;
-          }
-        }
-      } catch (altError) {
-        console.warn(`⚠️ Método alternativo falló:`, altError.message);
-      }
-
-      return res.status(404).json({ 
-        error: 'No streaming data', 
-        hint: 'Video podría estar restringido geográficamente o requiere autenticación'
-      });
-    }
-    
-    // Buscar formato de audio de buena calidad en adaptive_formats
-    let audioFormats = info.streaming_data?.adaptive_formats?.filter(f => 
-      f.audio_codec && !f.video_codec
-    ).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0)) || [];
-
-    // Fallback: si no hay adaptive, buscar en formats regulares (que tienen audio+video)
-    if (audioFormats.length === 0) {
-      console.log(`⚠️ No hay adaptive formats con audio, intentando formatos regulares...`);
-      audioFormats = info.streaming_data?.formats?.filter(f => 
-        f.audio_codec
-      ).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0)) || [];
-    }
-
-    // Fallback 2: Si aún no hay, intentar cualquier formato con codec de audio
-    if (audioFormats.length === 0) {
-      console.log(`⚠️ Sin formatos específicos, intentando cualquier formato disponible...`);
-      audioFormats = [...(info.streaming_data?.adaptive_formats || []), ...(info.streaming_data?.formats || [])]
-        .filter(f => f.audio_codec || f.video_codec)
-        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    }
-
-    if (!audioFormats || audioFormats.length === 0) {
-      console.warn(`❌ No se encontraron formatos para ${videoId}`);
-      return res.status(404).json({ error: 'No formats found' });
-    }
-
-    const format = audioFormats[0];
-    let streamUrl = format.url;
-
-    console.log(`✅ Formato seleccionado:`, {
-      audioCodec: format.audio_codec,
-      videoCodec: format.video_codec,
-      bitrate: format.bitrate,
-      hasCipher: !!format.cipher,
-      hasUrl: !!format.url,
-      mimeType: format.mime_type
-    });
-
-    // Si el formato requiere deciframiento
-    if (format.cipher) {
-      console.log(`🔐 Descifrando stream...`);
-      streamUrl = await format.decipher(youtube.session.player);
-      console.log(`✅ Stream descifrado correctamente`);
-    }
-
-    console.log(`✅ STREAM OBTENIDO: ${streamUrl.substring(0, 80)}...`);
-
-    if (json === 'true') {
-      res.json({ streamUrl });
-    } else {
-      // Si no pide JSON, hacer proxy del stream
-      const response = await fetch(streamUrl, {
-        headers: {
-          'Referer': 'https://www.youtube.com/',
-          'Origin': 'https://www.youtube.com/',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        }
-      });
-      
-      res.setHeader('Content-Type', response.headers.get('content-type') || 'audio/mp4');
-      res.setHeader('Content-Length', response.headers.get('content-length'));
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      
-      response.body.pipe(res);
-    }
-  } catch (error) {
-    console.error("❌ ERROR OBTENIENDO STREAM YOUTUBE:", error.message);
-    console.error("🔍 Error completo:", error);
-    res.status(500).json({ error: 'Error interno', message: error.message });
-  }
+  console.log(`🎬 OBTENIENDO STREAM YOUTUBE (yt-dlp): ${videoId}`);
+  return streamWithYtDlp(videoId, json, res);
 });
 
 const server = http.createServer(app);

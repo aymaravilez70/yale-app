@@ -52,6 +52,7 @@ function App() {
         <Lobby user={user} onLogout={handleLogout} onJoinRoom={handleJoinRoom} />
       ) : (
         <Room 
+          key={currentRoomId}
           roomId={currentRoomId} 
           user={user} 
           onLeave={() => setCurrentRoomId(null)} 
