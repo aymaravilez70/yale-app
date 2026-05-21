@@ -81,13 +81,54 @@ app.get('/api/youtube/stream', async (req, res) => {
     const info = await youtube.getInfo(videoId);
     
     // Debug: Log la estructura de streaming_data
-    console.log(`📊 Estructura de streaming_data:`, {
+    console.log(`📊 Info del video:`, {
+      title: info.basic_info?.title,
+      videoDetails: !!info.basic_info,
       hasStreamingData: !!info.streaming_data,
-      hasAdaptive: !!info.streaming_data?.adaptive_formats,
-      hasRegular: !!info.streaming_data?.formats,
-      adaptiveCount: info.streaming_data?.adaptive_formats?.length || 0,
-      regularCount: info.streaming_data?.formats?.length || 0
     });
+
+    // Verificar si es un video válido
+    if (!info.basic_info?.title) {
+      console.warn(`⚠️ Video no encontrado o no es válido: ${videoId}`);
+      return res.status(404).json({ error: 'Video no encontrado' });
+    }
+
+    // Si no hay streaming_data, intentar obtener el mejor formato disponible
+    if (!info.streaming_data) {
+      console.warn(`⚠️ Sin streaming_data. Intentando obtener mejor formato disponible...`);
+      
+      // Intentar usar el método de descarga de youtube.js si está disponible
+      try {
+        const format = await youtube.chooseFormat({ quality: 'best[ext=mp4]', type: 'audio' });
+        if (format?.url) {
+          console.log(`✅ Formato obtenido vía alternativo`);
+          const streamUrl = format.url;
+          
+          if (json === 'true') {
+            return res.json({ streamUrl });
+          } else {
+            const response = await fetch(streamUrl, {
+              headers: {
+                'Referer': 'https://www.youtube.com/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+              }
+            });
+            res.setHeader('Content-Type', response.headers.get('content-type') || 'audio/mp4');
+            res.setHeader('Content-Length', response.headers.get('content-length'));
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            response.body.pipe(res);
+            return;
+          }
+        }
+      } catch (altError) {
+        console.warn(`⚠️ Método alternativo falló:`, altError.message);
+      }
+
+      return res.status(404).json({ 
+        error: 'No streaming data', 
+        hint: 'Video podría estar restringido geográficamente o requiere autenticación'
+      });
+    }
     
     // Buscar formato de audio de buena calidad en adaptive_formats
     let audioFormats = info.streaming_data?.adaptive_formats?.filter(f => 
@@ -96,29 +137,23 @@ app.get('/api/youtube/stream', async (req, res) => {
 
     // Fallback: si no hay adaptive, buscar en formats regulares (que tienen audio+video)
     if (audioFormats.length === 0) {
-      console.log(`⚠️ No hay adaptive formats con audio, intentando fallback a formatos regulares...`);
+      console.log(`⚠️ No hay adaptive formats con audio, intentando formatos regulares...`);
       audioFormats = info.streaming_data?.formats?.filter(f => 
-        f.audio_codec && f.video_codec
+        f.audio_codec
       ).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0)) || [];
     }
 
     // Fallback 2: Si aún no hay, intentar cualquier formato con codec de audio
     if (audioFormats.length === 0) {
-      console.log(`⚠️ No hay formatos regulares, intentando cualquier formato con audio...`);
+      console.log(`⚠️ Sin formatos específicos, intentando cualquier formato disponible...`);
       audioFormats = [...(info.streaming_data?.adaptive_formats || []), ...(info.streaming_data?.formats || [])]
-        .filter(f => f.audio_codec)
+        .filter(f => f.audio_codec || f.video_codec)
         .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
     }
 
     if (!audioFormats || audioFormats.length === 0) {
-      console.warn(`❌ No se encontraron formatos de audio para ${videoId}`);
-      console.warn(`📋 Datos disponibles:`, {
-        videoId,
-        title: info.basic_info?.title,
-        hasStreamingData: !!info.streaming_data,
-        allFormats: info.streaming_data?.adaptive_formats?.map(f => ({codec: f.audio_codec, video: f.video_codec, bitrate: f.bitrate})) || []
-      });
-      return res.status(404).json({ error: 'No audio formats found' });
+      console.warn(`❌ No se encontraron formatos para ${videoId}`);
+      return res.status(404).json({ error: 'No formats found' });
     }
 
     const format = audioFormats[0];
@@ -129,7 +164,8 @@ app.get('/api/youtube/stream', async (req, res) => {
       videoCodec: format.video_codec,
       bitrate: format.bitrate,
       hasCipher: !!format.cipher,
-      hasUrl: !!format.url
+      hasUrl: !!format.url,
+      mimeType: format.mime_type
     });
 
     // Si el formato requiere deciframiento
@@ -161,7 +197,7 @@ app.get('/api/youtube/stream', async (req, res) => {
     }
   } catch (error) {
     console.error("❌ ERROR OBTENIENDO STREAM YOUTUBE:", error.message);
-    console.error("📍 Stack:", error.stack);
+    console.error("🔍 Error completo:", error);
     res.status(500).json({ error: 'Error interno', message: error.message });
   }
 });
