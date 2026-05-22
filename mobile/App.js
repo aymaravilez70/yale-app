@@ -4,17 +4,21 @@ import { View, ActivityIndicator, Platform } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Notifications from 'expo-notifications';
 import storage from './src/utils/storage';
+import { ACTIVE_ROOM_KEY } from './src/constants/session';
 import Login from './src/components/Login';
 import Lobby from './src/components/lobby/Lobby';
 import Room from './src/components/room/Room';
 
 // Configurar el manejador global de notificaciones (afuera del componente)
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-  }),
+  handleNotification: async (notification) => {
+    const isNowPlaying = notification.request.content.data?.type === 'now-playing';
+    return {
+      shouldShowAlert: !isNowPlaying,
+      shouldPlaySound: !isNowPlaying,
+      shouldSetBadge: false,
+    };
+  },
 });
 
 export default function App() {
@@ -26,7 +30,6 @@ export default function App() {
   useEffect(() => {
     const registerForNotifications = async () => {
       if (Platform.OS === 'android') {
-        // Configurar el canal obligatorio para Android con máxima importancia
         await Notifications.setNotificationChannelAsync('default', {
           name: 'default',
           importance: Notifications.AndroidImportance.MAX,
@@ -67,7 +70,7 @@ export default function App() {
     });
 
     return () => {
-      Notifications.removeNotificationSubscription(notificationListener);
+      notificationListener?.remove?.();
     };
   }, []);
 
@@ -75,8 +78,12 @@ export default function App() {
   useEffect(() => {
     const loadSession = async () => {
       const savedUser = await storage.getItem('yale_user');
+      const savedRoomId = await storage.getItem(ACTIVE_ROOM_KEY);
       if (savedUser) {
         setUser(savedUser);
+      }
+      if (savedUser && savedRoomId) {
+        setActiveRoomId(String(savedRoomId));
       }
       setLoading(false);
     };
@@ -89,7 +96,18 @@ export default function App() {
 
   const handleLogout = async () => {
     await storage.removeItem('yale_user');
+    await storage.removeItem(ACTIVE_ROOM_KEY);
     setUser(null);
+    setActiveRoomId(null);
+  };
+
+  const handleJoinRoom = async (roomId) => {
+    setActiveRoomId(roomId);
+    await storage.setItem(ACTIVE_ROOM_KEY, roomId);
+  };
+
+  const handleLeaveRoom = async () => {
+    await storage.removeItem(ACTIVE_ROOM_KEY);
     setActiveRoomId(null);
   };
 
@@ -110,14 +128,14 @@ export default function App() {
         <Lobby 
           user={user} 
           onLogout={handleLogout} 
-          onJoinRoom={(roomId) => setActiveRoomId(roomId)} 
+          onJoinRoom={handleJoinRoom} 
         />
       ) : (
         <Room 
           key={activeRoomId}
           roomId={activeRoomId} 
           user={user} 
-          onLeave={() => setActiveRoomId(null)} 
+          onLeave={handleLeaveRoom} 
         />
       )}
     </View>

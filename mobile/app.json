@@ -8,7 +8,7 @@
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/splash.png",
       "resizeMode": "contain",
       "backgroundColor": "#0a0a0a"
     },
@@ -21,21 +21,32 @@
       }
     },
     "android": {
+      "versionCode": 2,
+      "usesCleartextTraffic": true,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0a0a0a"
       },
-      "edgeToEdgeEnabled": true,
       "softwareKeyboardLayoutMode": "pan",
       "permissions": [
         "android.permission.WAKE_LOCK",
         "android.permission.FOREGROUND_SERVICE",
-        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.INTERNET"
       ],
       "package": "com.aymar66.yale"
     },
     "plugins": [
+      "expo-dev-client",
       "expo-screen-orientation",
+      [
+        "expo-media-control",
+        {
+          "enableBackgroundAudio": true,
+          "audioSessionCategory": "playback"
+        }
+      ],
       [
         "expo-notifications",
         {
@@ -48,6 +59,8 @@
       "favicon": "./assets/favicon.png"
     },
     "extra": {
+      "apiUrl": "https://yale-app.onrender.com",
+      "socketUrl": "https://yale-app.onrender.com",
       "eas": {
         "projectId": "91f7de09-4bb1-45b0-9d79-45669904bb97"
       }

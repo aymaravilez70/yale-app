@@ -3,12 +3,24 @@ import { Text, View, TextInput, TouchableOpacity, SafeAreaView, ActivityIndicato
 import { WebView } from 'react-native-webview';
 import { ChevronLeft, ChevronRight, RotateCw, X, Globe, PlusCircle } from 'lucide-react-native';
 import socket from '../../config/socket';
+import { getStreamingPlatform } from '../../constants/streamingPlatforms';
 
 const adBlockedDomains = [];
 
-const MiniBrowser = ({ visible, roomId, isHost, onClose, initialUri = 'https://duckduckgo.com', onAddToQueue }) => {
-  const [uri, setUri] = useState(initialUri);
-  const [inputUrl, setInputUrl] = useState(initialUri);
+const MiniBrowser = ({
+  visible,
+  roomId,
+  isHost,
+  onClose,
+  initialUri,
+  platformId = 'browser',
+  onAddToQueue,
+}) => {
+  const platform = getStreamingPlatform(platformId);
+  const defaultUri = initialUri || platform.homeUrl;
+
+  const [uri, setUri] = useState(defaultUri);
+  const [inputUrl, setInputUrl] = useState(defaultUri);
   const [loading, setLoading] = useState(false);
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
@@ -17,7 +29,15 @@ const MiniBrowser = ({ visible, roomId, isHost, onClose, initialUri = 'https://d
   const canGoBackRef = useRef(false);
   const lastEmittedUrlRef = useRef(initialUri);
   const isManualNavigationRef = useRef(false);
-  const lastLegitimateUrlRef = useRef(initialUri);
+  const lastLegitimateUrlRef = useRef(defaultUri);
+
+  useEffect(() => {
+    if (!visible) return;
+    const next = initialUri || platform.homeUrl;
+    setUri(next);
+    setInputUrl(next);
+    lastLegitimateUrlRef.current = next;
+  }, [visible, initialUri, platform.homeUrl]);
 
   const beforeContentScript = `
     (function() {
@@ -515,7 +535,7 @@ const MiniBrowser = ({ visible, roomId, isHost, onClose, initialUri = 'https://d
               value={inputUrl}
               onChangeText={setInputUrl}
               onSubmitEditing={handleNavigate}
-              placeholder="Navegar por la web..."
+              placeholder={platformId === 'kick' ? 'kick.com/canal…' : 'Navegar por la web...'}
               placeholderTextColor="#6b7280"
               className="flex-1 text-white text-xs py-0"
               autoCapitalize="none"
@@ -531,14 +551,22 @@ const MiniBrowser = ({ visible, roomId, isHost, onClose, initialUri = 'https://d
               onPress={() => {
                 const currentUrl = inputUrl;
                 const title = currentUrl.replace(/^https?:\/\//, '').split('/')[0];
-                onAddToQueue({ url: currentUrl, title });
+                onAddToQueue({
+                  url: currentUrl,
+                  title,
+                  platformId,
+                });
                 if (Platform.OS === 'android') {
                   ToastAndroid.show('Añadido a la cola ✓', ToastAndroid.SHORT);
                 } else {
                   Alert.alert('Cola', 'Añadido a la cola de reproducción');
                 }
               }}
-              style={{ padding: 8, backgroundColor: '#6366f1', borderRadius: 12 }}
+              style={{
+                padding: 8,
+                backgroundColor: platform.accent,
+                borderRadius: 12,
+              }}
             >
               <PlusCircle size={20} color="#ffffff" />
             </TouchableOpacity>

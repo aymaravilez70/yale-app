@@ -46,3 +46,17 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Basura local / herramientas
+repomix-output.xml
+repomix.config.json
+.repomixignore
+buildlog.txt
+*.lnk
+npx
+npm
+cd
+Get
+Run
+Evaluating
+java.io.*

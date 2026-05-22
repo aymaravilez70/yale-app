@@ -5,6 +5,11 @@ import { WebView } from 'react-native-webview';
 import { Search, X, Play, Globe, ArrowLeft, Tv, Film, ChevronLeft, ChevronRight, RotateCw } from 'lucide-react-native';
 import socket from '../../config/socket';
 import { API_BASE_URL } from '../../config/config';
+import {
+  getStreamingPlatform,
+  buildBrowserSyncVideo,
+  KICK_LIVE_DETECT_SCRIPT,
+} from '../../constants/streamingPlatforms';
 
 const adBlockedDomains = [];
 
@@ -88,8 +93,11 @@ const CreateRoomModal = ({ visible, user, onClose, onCreateSuccess }) => {
   React.useEffect(() => {
     if (visible) {
       isCreatingRef.current = false;
+      processingKickRef.current = null;
     }
   }, [visible]);
+
+  const processingKickRef = React.useRef(null);
 
   const ytInjectedScript = `
     (function() {
@@ -676,8 +684,24 @@ const CreateRoomModal = ({ visible, user, onClose, onCreateSuccess }) => {
             setTimeout(() => { processingVideoIdRef.current = null; }, 3000);
           });
       } else if (data.type === 'VIDEO_PLAY_DETECTED') {
+        if (selectedApp === 'kick') return;
         setShowYtBrowser(false);
-        selectBrowserUrl(data.url, data.title, data.poster || null);
+        selectBrowserUrl(data.url, data.title, data.poster || null, 'browser');
+      } else if (data.type === 'KICK_STREAM_DETECTED') {
+        if (!data.isLive || !data.channel) return;
+        const kickKey = data.channel + ':' + (data.url || '');
+        if (processingKickRef.current === kickKey) return;
+        processingKickRef.current = kickKey;
+        setShowYtBrowser(false);
+        selectBrowserUrl(
+          data.url,
+          data.title || data.channel || 'Kick',
+          null,
+          'kick'
+        );
+        setTimeout(() => {
+          processingKickRef.current = null;
+        }, 5000);
       } else if (data.type === 'METADATA_EXTRACTED') {
         if (data.title) {
           setCurrentBrowserTitle(data.title);
@@ -737,22 +761,27 @@ const CreateRoomModal = ({ visible, user, onClose, onCreateSuccess }) => {
     onCreateSuccess(roomId);
   };
 
-  const selectBrowserUrl = (url, title = 'Navegador Sincronizado', poster = null) => {
+  const selectBrowserUrl = (
+    url,
+    title = 'Navegador Sincronizado',
+    poster = null,
+    platformId = 'browser'
+  ) => {
     if (isCreatingRef.current) return;
     isCreatingRef.current = true;
-    console.log("🚀 [MOBILE] Solicitando creación de sala por navegador:", url);
+    console.log('🚀 [MOBILE] Creación de sala embed:', platformId, url);
 
     const roomId = Date.now().toString();
     const nuevaSala = {
       sala_id: roomId,
       creador: user.username,
-      privacidad: "Public",
-      video_actual: {
-        id: 'browser_sync',
-        titulo: title,
-        miniatura: poster || currentBrowserPoster || 'https://images.unsplash.com/photo-1507238691740-187a5b1d37b8?q=80&w=300&auto=format&fit=crop',
-        browserUrl: url
-      }
+      privacidad: 'Public',
+      video_actual: buildBrowserSyncVideo({
+        url,
+        title: title || getStreamingPlatform(platformId).defaultTitle,
+        poster: poster || currentBrowserPoster,
+        platformId,
+      }),
     };
 
     socket.emit('crear-sala', nuevaSala);
@@ -828,6 +857,31 @@ const CreateRoomModal = ({ visible, user, onClose, onCreateSuccess }) => {
                     </View>
                   </TouchableOpacity>
 
+                  {/* KICK (ACTIVO) */}
+                  <TouchableOpacity
+                    activeOpacity={0.8}
+                    onPress={() => {
+                      setSelectedApp('kick');
+                      setCurrentBrowserUrl('https://kick.com');
+                      setCurrentBrowserTitle('Kick');
+                    }}
+                    className="w-[47%] aspect-[1.1] rounded-3xl p-5 justify-between shadow-lg"
+                    style={{ backgroundColor: 'rgba(83,252,24,0.08)', borderWidth: 1, borderColor: 'rgba(83,252,24,0.25)' }}
+                  >
+                    <View
+                      className="w-12 h-12 rounded-2xl items-center justify-center"
+                      style={{ backgroundColor: '#53FC18' }}
+                    >
+                      <Text className="text-black font-black text-lg">K</Text>
+                    </View>
+                    <View>
+                      <Text className="text-white font-black text-base">Kick</Text>
+                      <Text style={{ color: '#53FC18', fontSize: 10, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 1, marginTop: 2 }}>
+                        Activo
+                      </Text>
+                    </View>
+                  </TouchableOpacity>
+
                   {/* NETFLIX (INACTIVO) */}
                   <View className="w-[47%] aspect-[1.1] bg-dark-900/50 border border-white/5 rounded-3xl p-5 justify-between opacity-50">
                     <View className="w-12 h-12 bg-dark-900 rounded-2xl items-center justify-center">
@@ -874,7 +928,7 @@ const CreateRoomModal = ({ visible, user, onClose, onCreateSuccess }) => {
                 </View>
               </ScrollView>
             </>
-          ) : selectedApp === 'browser' ? (
+          ) : selectedApp === 'browser' || selectedApp === 'kick' ? (
             <>
               {/* Web Browser Selector Header */}
               <View className="flex-row justify-between items-center p-6 border-b border-white/5">
@@ -886,8 +940,14 @@ const CreateRoomModal = ({ visible, user, onClose, onCreateSuccess }) => {
                     <ArrowLeft className="w-4 h-4 text-white" color="#ffffff" />
                   </TouchableOpacity>
                   <View>
-                    <Text className="text-xl font-black text-white">Navegador Web</Text>
-                    <Text className="text-gray-400 text-xs mt-0.5">Navega y comparte cualquier web</Text>
+                    <Text className="text-xl font-black text-white">
+                      {selectedApp === 'kick' ? 'Kick' : 'Navegador Web'}
+                    </Text>
+                    <Text className="text-gray-400 text-xs mt-0.5">
+                      {selectedApp === 'kick'
+                        ? 'Abre un canal en vivo y sincroniza con la sala'
+                        : 'Navega y comparte cualquier web'}
+                    </Text>
                   </View>
                 </View>
                 <TouchableOpacity 
@@ -906,19 +966,40 @@ const CreateRoomModal = ({ visible, user, onClose, onCreateSuccess }) => {
                 <View className="w-16 h-16 bg-indigo-600/10 border border-indigo-500/20 rounded-2xl items-center justify-center mb-4">
                   <Globe className="w-8 h-8 text-indigo-500" />
                 </View>
-                <Text className="text-white text-lg font-black text-center">Navegador Web Sincronizado</Text>
+                <Text className="text-white text-lg font-black text-center">
+                  {selectedApp === 'kick' ? 'Kick en vivo' : 'Navegador Web Sincronizado'}
+                </Text>
                 <Text className="text-gray-400 text-xs text-center mt-2 px-6 leading-relaxed">
-                  Entra a cualquier sitio web de videos y sincroniza la reproducción en vivo con tus amigos.
+                  {selectedApp === 'kick'
+                    ? 'Abre el canal de un stream EN VIVO. La sala se crea sola cuando detecte la transmisión.'
+                    : 'Entra a cualquier sitio web de videos y sincroniza la reproducción en vivo con tus amigos.'}
                 </Text>
                 <TouchableOpacity
                   activeOpacity={0.8}
-                  onPress={() => setShowYtBrowser(true)}
-                  className="mt-8 py-3.5 px-8 bg-indigo-600 rounded-2xl flex-row items-center gap-2 shadow-lg shadow-indigo-600/30"
+                  onPress={() => {
+                    if (selectedApp === 'kick') {
+                      setCurrentBrowserUrl('https://kick.com');
+                      setCurrentBrowserTitle('Kick');
+                    }
+                    setShowYtBrowser(true);
+                  }}
+                  className="mt-8 py-3.5 px-8 rounded-2xl flex-row items-center gap-2 shadow-lg"
+                  style={{
+                    backgroundColor: selectedApp === 'kick' ? '#53FC18' : '#6366f1',
+                  }}
                 >
-                  <Globe className="w-4 h-4 text-white" />
-                  <Text className="text-white font-black text-xs uppercase tracking-widest">
-                    Abrir Navegador Web
-                  </Text>
+                  {selectedApp === 'kick' ? (
+                    <Text className="text-black font-black text-xs uppercase tracking-widest">
+                      Abrir Kick
+                    </Text>
+                  ) : (
+                    <>
+                      <Globe className="w-4 h-4 text-white" />
+                      <Text className="text-white font-black text-xs uppercase tracking-widest">
+                        Abrir Navegador Web
+                      </Text>
+                    </>
+                  )}
                 </TouchableOpacity>
               </View>
 
@@ -988,56 +1069,69 @@ const CreateRoomModal = ({ visible, user, onClose, onCreateSuccess }) => {
                   </View>
 
                   <View className="flex-1 relative">
-                    <WebView
-                      ref={webViewRef}
-                      source={{ uri: 'https://duckduckgo.com' }}
-                      injectedJavaScriptBeforeContentLoaded={beforeContentScript}
-                      injectedJavaScript={ytInjectedScript + adBlockScript + generalVideoDetectorScript}
-                      injectedJavaScriptForMainFrameOnly={false}
-                      injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
-                      onNavigationStateChange={(navState) => {
-                        setCurrentBrowserUrl(navState.url);
-                        setCurrentBrowserTitle(navState.title || 'Navegador Web');
-                        setCanGoBack(navState.canGoBack);
-                        canGoBackRef.current = navState.canGoBack;
-                        setCanGoForward(navState.canGoForward);
-                        
-                        // Registrar última URL
-                        const url = navState.url;
-                        if (url && !url.startsWith('about:')) {
-                          lastLegitimateUrlRef.current = url;
+                    {showYtBrowser && (
+                      <WebView
+                        ref={webViewRef}
+                        source={{
+                          uri:
+                            selectedApp === 'kick'
+                              ? 'https://kick.com'
+                              : 'https://duckduckgo.com',
+                        }}
+                        injectedJavaScriptBeforeContentLoaded={beforeContentScript}
+                        injectedJavaScript={
+                          selectedApp === 'kick'
+                            ? KICK_LIVE_DETECT_SCRIPT + adBlockScript
+                            : ytInjectedScript +
+                              adBlockScript +
+                              generalVideoDetectorScript
                         }
+                        injectedJavaScriptForMainFrameOnly={false}
+                        injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
+                        onNavigationStateChange={(navState) => {
+                          setCurrentBrowserUrl(navState.url);
+                          setCurrentBrowserTitle(navState.title || 'Navegador Web');
+                          setCanGoBack(navState.canGoBack);
+                          canGoBackRef.current = navState.canGoBack;
+                          setCanGoForward(navState.canGoForward);
+                          
+                          // Registrar última URL
+                          const url = navState.url;
+                          if (url && !url.startsWith('about:')) {
+                            lastLegitimateUrlRef.current = url;
+                          }
 
-                        // Limpiar el póster si volvemos a un buscador o página de inicio
-                        if (url && (url.includes('duckduckgo.com') || url.includes('google.com') || url === 'https://duckduckgo.com' || url === 'https://duckduckgo.com/')) {
-                          setCurrentBrowserPoster('');
-                        }
-                      }}
-                      onShouldStartLoadWithRequest={(request) => {
-                        const url = request.url;
-                        console.log("🔍 [CreateRoomModal Network] Petición de carga detectada:", url);
+                          // Limpiar el póster si volvemos a un buscador o página de inicio
+                          if (url && (url.includes('duckduckgo.com') || url.includes('google.com') || url === 'https://duckduckgo.com' || url === 'https://duckduckgo.com/')) {
+                            setCurrentBrowserPoster('');
+                          }
+                        }}
+                        onShouldStartLoadWithRequest={(request) => {
+                          const url = request.url;
+                          console.log("🔍 [CreateRoomModal Network] Petición de carga detectada:", url);
 
-                        if (url.startsWith('about:') || url.startsWith('data:') || url.startsWith('blob:')) {
+                          if (url.startsWith('about:') || url.startsWith('data:') || url.startsWith('blob:')) {
+                            return true;
+                          }
+
+                          if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                            console.log("🚫 Standalone AdBlocker: Esquema no HTTP bloqueado:", url);
+                            return false;
+                          }
+
                           return true;
-                        }
-
-                        if (!url.startsWith('http://') && !url.startsWith('https://')) {
-                          console.log("🚫 Standalone AdBlocker: Esquema no HTTP bloqueado:", url);
-                          return false;
-                        }
-
-                        return true;
-                      }}
-                      onMessage={handleYtMessage}
-                      allowsInlineMediaPlayback={true}
-                      domStorageEnabled={true}
-                      javaScriptEnabled={true}
-                      mixedContentMode="always"
-                      incognito={true}
-                      cacheEnabled={false}
-                      cacheMode="LOAD_NO_CACHE"
-                      className="flex-1"
-                    />
+                        }}
+                        onMessage={handleYtMessage}
+                        allowsInlineMediaPlayback={true}
+                        domStorageEnabled={true}
+                        javaScriptEnabled={true}
+                        mixedContentMode="always"
+                        incognito={true}
+                        cacheEnabled={false}
+                        cacheMode="LOAD_NO_CACHE"
+                        className="flex-1"
+                      />
+                    )}
                   </View>
                 </SafeAreaView>
               </Modal>
@@ -1069,20 +1163,22 @@ const CreateRoomModal = ({ visible, user, onClose, onCreateSuccess }) => {
                       <X className="w-5 h-5 text-white" color="#ffffff" />
                     </TouchableOpacity>
                   </View>
-                  <WebView
-                    source={{ uri: 'https://m.youtube.com' }}
-                    injectedJavaScriptBeforeContentLoaded={beforeContentScript}
-                    injectedJavaScript={ytInjectedScript + adBlockScript}
-                    onMessage={handleYtMessage}
-                    allowsInlineMediaPlayback={true}
-                    domStorageEnabled={true}
-                    javaScriptEnabled={true}
-                    mixedContentMode="always"
-                    incognito={true}
-                    cacheEnabled={false}
-                    cacheMode="LOAD_NO_CACHE"
-                    className="flex-1"
-                  />
+                  {showYtBrowser && (
+                    <WebView
+                      source={{ uri: 'https://m.youtube.com' }}
+                      injectedJavaScriptBeforeContentLoaded={beforeContentScript}
+                      injectedJavaScript={ytInjectedScript + adBlockScript}
+                      onMessage={handleYtMessage}
+                      allowsInlineMediaPlayback={true}
+                      domStorageEnabled={true}
+                      javaScriptEnabled={true}
+                      mixedContentMode="always"
+                      incognito={true}
+                      cacheEnabled={false}
+                      cacheMode="LOAD_NO_CACHE"
+                      className="flex-1"
+                    />
+                  )}
                 </SafeAreaView>
               </Modal>
             </>

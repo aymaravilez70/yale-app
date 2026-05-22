@@ -8,6 +8,10 @@ android/.gradle/
 dist/
 node_modules/
 *.log
+repomix-output.xml
+repomix.config.json
+buildlog.txt
+*.lnk
 
 # Ignore generated native artifacts and caches
 *.keystore

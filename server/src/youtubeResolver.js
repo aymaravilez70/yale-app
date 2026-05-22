@@ -195,6 +195,7 @@ async function fetchYtDlpJson(watchUrl, extraOpts = {}) {
   const opts = {
     ...buildYtDlpBaseOpts(),
     dumpSingleJson: true,
+    ignoreNoFormatsError: true,
     ...extraOpts,
   };
   delete opts.format;
@@ -208,29 +209,36 @@ async function resolveWithYtDlp(videoId) {
   logCookiesStatus();
 
   const clientArgs = [
+    null,
     process.env.YOUTUBE_YTDLP_EXTRACTOR_ARGS,
     'youtube:player_client=android,web',
     'youtube:player_client=ios',
     'youtube:player_client=tv_embedded',
     'youtube:player_client=mweb',
-  ].filter(Boolean);
+  ].filter((v) => v !== undefined);
 
   for (const extractorArgs of clientArgs) {
     try {
-      const meta = await fetchYtDlpJson(watchUrl, { extractorArgs });
+      const meta = await fetchYtDlpJson(
+        watchUrl,
+        extractorArgs ? { extractorArgs } : {}
+      );
+
       const picked = pickUrlFromYtDlpMeta(meta);
       if (!picked?.url) {
-        errors.push(`${extractorArgs}: JSON sin URLs (${meta?.formats?.length || 0} formatos)`);
+        const label = extractorArgs || 'default';
+        errors.push(`${label}: JSON sin URLs (${meta?.formats?.length || 0} formatos)`);
         continue;
       }
       console.log(
-        `✅ Stream yt-dlp ${videoId} (${picked.formatId || '?'}) [${extractorArgs}] via ${picked.via}`
+        `✅ Stream yt-dlp ${videoId} (${picked.formatId || '?'}) [${extractorArgs || 'default'}] via ${picked.via}`
       );
       return picked.url;
     } catch (err) {
       const msg = (err.stderr || err.message || String(err)).replace(/\s+/g, ' ').trim();
-      errors.push(`${extractorArgs}: ${msg.slice(0, 160)}`);
-      console.warn(`⚠️ yt-dlp list [${extractorArgs}]: ${msg.slice(0, 120)}`);
+      const label = extractorArgs || 'default';
+      errors.push(`${label}: ${msg.slice(0, 160)}`);
+      console.warn(`⚠️ yt-dlp list [${label}]: ${msg.slice(0, 120)}`);
     }
   }
 

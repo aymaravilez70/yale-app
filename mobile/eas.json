@@ -3,13 +3,16 @@
     "version": ">= 3.0.0"
   },
   "build": {
-    "production": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
       "android": {
         "buildType": "apk"
       },
       "env": {
         "EXPO_PUBLIC_API_URL": "https://yale-app.onrender.com",
-        "EXPO_PUBLIC_SOCKET_URL": "https://yale-app.onrender.com"
+        "EXPO_PUBLIC_SOCKET_URL": "https://yale-app.onrender.com",
+        "EXPO_PUBLIC_YOUTUBE_DIRECT": "true"
       }
     },
     "preview": {
@@ -18,7 +21,18 @@
       },
       "env": {
         "EXPO_PUBLIC_API_URL": "https://yale-app.onrender.com",
-        "EXPO_PUBLIC_SOCKET_URL": "https://yale-app.onrender.com"
+        "EXPO_PUBLIC_SOCKET_URL": "https://yale-app.onrender.com",
+        "EXPO_PUBLIC_YOUTUBE_DIRECT": "true"
+      }
+    },
+    "production": {
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://yale-app.onrender.com",
+        "EXPO_PUBLIC_SOCKET_URL": "https://yale-app.onrender.com",
+        "EXPO_PUBLIC_YOUTUBE_DIRECT": "true"
       }
     }
   }

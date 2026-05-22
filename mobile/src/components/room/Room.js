@@ -1,14 +1,30 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { Text, View, TextInput, TouchableOpacity, Pressable, Image, ScrollView, FlatList, KeyboardAvoidingView, Platform, ActivityIndicator, Alert, Modal, BackHandler, StyleSheet, StatusBar as RNStatusBar, Animated, AppState } from 'react-native';
+import { Text, View, TextInput, TouchableOpacity, Pressable, Image, ScrollView, FlatList, KeyboardAvoidingView, Platform, ActivityIndicator, Alert, Modal, BackHandler, StyleSheet, StatusBar as RNStatusBar, Animated, AppState, Dimensions } from 'react-native';
+import YoutubePlayer from 'react-native-youtube-iframe';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { WebView } from 'react-native-webview';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { StatusBar } from 'expo-status-bar';
-import { Send, ChevronLeft, Users, MessageSquare, Lock, Play, Pause, Search, X, Globe, Smile, Settings, Maximize2, Minimize2 } from 'lucide-react-native';
+import { Send, ChevronLeft, Users, MessageSquare, Lock, Play, Pause, Search, X, Globe, Smile, Settings, Maximize2, Minimize2, Volume2, SkipForward } from 'lucide-react-native';
 import socket from '../../config/socket';
-import { API_BASE_URL } from '../../config/config';
+import { API_BASE_URL, YOUTUBE_DIRECT_PLAYBACK } from '../../config/config';
 import MiniBrowser from './MiniBrowser';
 import * as Notifications from 'expo-notifications';
+import {
+  initMediaSession,
+  teardownMediaSession,
+  updateMediaSession,
+  ensureStreamPlayback,
+  syncStreamPlayback,
+  keepNativePlaying,
+  pauseNativeStream,
+  stopNativeStream,
+  getStreamPositionSec,
+  buildStreamUrl,
+  setupRoomAudioSession,
+} from '../../audio/roomBackgroundPlayer';
+import { PLAYBACK_SYNC } from '../../constants/playbackSync';
+import { buildBrowserSyncVideo } from '../../constants/streamingPlatforms';
 
 
 const enviarNotificacionLocal = async (titulo, cuerpo) => {
@@ -44,13 +60,8 @@ const formatPlayerTime = (seconds) => {
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 };
 
-const SYNC_INTERVAL_MS = 500;
-const SYNC_DRIFT_THRESHOLD = 0.6;
-const GUEST_SYNC_DRIFT_THRESHOLD = 1.1;
-const HOST_HEARTBEAT_MS = 1200;
-const GUEST_SYNC_INTERVAL_MS = 900;
 const CONTROLS_HIDE_MS = 4500;
-const UI_TICK_MS = 200;
+const UI_TICK_MS = 280;
 
 // HTML estático: no incluir isHost aquí o el WebView se recarga al cambiar de admin
 const HTML_PLAYER_SOURCE = {
@@ -67,17 +78,60 @@ const HTML_PLAYER_SOURCE = {
   </style>
 </head>
 <body>
-  <video id="player" playsinline webkit-playsinline></video>
+  <video id="player" playsinline webkit-playsinline preload="auto"></video>
   <script>
     const player = document.getElementById('player');
     window.__yaleIsHost = false;
     window.__yalePlaying = true;
+    window.__yaleAudioSource = 'webview';
+
+    function forceVideoMuted() {
+      player.muted = true;
+      player.defaultMuted = true;
+      player.volume = 0;
+    }
+
+    function enableWebviewAudio() {
+      player.muted = false;
+      player.defaultMuted = false;
+      player.volume = 1;
+      try {
+        if (player.audioTracks && player.audioTracks.length) {
+          for (var i = 0; i < player.audioTracks.length; i++) {
+            player.audioTracks[i].enabled = true;
+          }
+        }
+      } catch (e) {}
+    }
+
+    function applyAudioRoute() {
+      if (window.__yaleAudioSource === 'webview') enableWebviewAudio();
+      else forceVideoMuted();
+    }
+
+    function playVideoForRoute() {
+      applyAudioRoute();
+      var promise = player.play();
+      if (!promise || !promise.catch) return promise;
+      return promise.catch(function() {
+        applyAudioRoute();
+        return player.play();
+      });
+    }
+
+    applyAudioRoute();
 
     player.onplaying = () => window.ReactNativeWebView.postMessage(JSON.stringify({type: 'PLAYING', time: player.currentTime}));
     player.onpause = () => window.ReactNativeWebView.postMessage(JSON.stringify({type: 'PAUSED', time: player.currentTime}));
     player.onended = () => window.ReactNativeWebView.postMessage(JSON.stringify({type: 'ENDED'}));
     player.ontimeupdate = () => window.ReactNativeWebView.postMessage(JSON.stringify({type: 'TIME', time: player.currentTime}));
-    player.onerror = () => window.ReactNativeWebView.postMessage(JSON.stringify({type: 'ERROR', code: player.error ? player.error.code : 'unknown'}));
+    player.onerror = function() {
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'ERROR',
+        code: player.error ? player.error.code : 'unknown',
+        src: player.currentSrc || ''
+      }));
+    };
     player.controls = false;
     player.removeAttribute('controls');
 
@@ -99,82 +153,131 @@ const HTML_PLAYER_SOURCE = {
 
     setInterval(function() {
       if (!player.paused && !player.ended) postTimeTick();
-    }, 250);
+    }, 350);
 
     function handleMessage(data) {
       try {
         const msg = JSON.parse(data);
+        if (msg.type === 'SET_AUDIO_SOURCE') {
+          window.__yaleAudioSource = msg.source === 'native' ? 'native' : 'webview';
+          applyAudioRoute();
+          return;
+        }
         if (msg.type === 'SET_ROLE') {
           window.__yaleIsHost = !!msg.isHost;
           window.__yalePlaying = msg.playing !== false;
-          if (msg.playing && player.paused) {
-            player.play().catch(function() {
-              player.muted = true;
-              player.play().then(function() { setTimeout(function() { player.muted = false; }, 300); }).catch(function() {});
-            });
-          }
+          applyAudioRoute();
+          if (window.__yalePlaying && player.paused) playVideoForRoute();
+          else if (!window.__yalePlaying && !player.paused) { applyAudioRoute(); player.pause(); }
           return;
         }
         if (msg.type === 'SYNC') {
           const target = typeof msg.time === 'number' ? msg.time : 0;
           const drift = Math.abs(player.currentTime - target);
-          if (drift > 0.25 && target >= 0) player.currentTime = target;
-          if (msg.playing && player.paused) {
-            player.play().catch(function() {
-              player.muted = true;
-              player.play().then(function() { setTimeout(function() { player.muted = false; }, 300); }).catch(function() {});
-            });
-          } else if (msg.playing === false && !player.paused) {
-            player.pause();
-          }
+          if (drift > ${PLAYBACK_SYNC.DRIFT_HTML_SEC} && target >= 0) player.currentTime = target;
+          applyAudioRoute();
+          window.__yalePlaying = msg.playing !== false;
+          if (window.__yalePlaying && player.paused) playVideoForRoute();
+          else if (!window.__yalePlaying && !player.paused) { applyAudioRoute(); player.pause(); }
           return;
         }
         if (msg.type === 'SEEK_INITIAL') {
           if (msg.time > 0) player.currentTime = msg.time;
-          if (msg.autoplay) {
-            player.play().catch(function() {
-              player.muted = true;
-              player.play().then(function() { setTimeout(function() { player.muted = false; }, 300); }).catch(function() {});
-            });
-          }
+          if (msg.autoplay) playVideoForRoute();
+          return;
+        }
+        if (msg.type === 'UNMUTE') {
+          window.__yaleAudioSource = 'webview';
+          enableWebviewAudio();
+          if (msg.playing !== false && player.paused) playVideoForRoute();
           return;
         }
         if (msg.type === 'LOAD') {
-          player.src = msg.url;
+          applyAudioRoute();
           const targetStartTime = msg.startTime || 0;
-          const onMetadataLoaded = () => {
+          const onMetadataLoaded = function() {
+            applyAudioRoute();
             if (targetStartTime > 0) player.currentTime = targetStartTime;
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              type: 'LOADED',
+              duration: player.duration || 0,
+              time: player.currentTime || 0
+            }));
             player.removeEventListener('loadedmetadata', onMetadataLoaded);
+            if (msg.autoplay) playVideoForRoute();
           };
           player.addEventListener('loadedmetadata', onMetadataLoaded);
+          player.src = msg.url;
           player.load();
-          if (msg.autoplay) player.play().catch(function() {});
+        } else if (msg.type === 'VIDEO_PLAY') {
+          applyAudioRoute();
+          if (typeof msg.time === 'number' && msg.time >= 0) player.currentTime = msg.time;
+          window.__yalePlaying = msg.playing !== false;
+          if (window.__yalePlaying) playVideoForRoute();
+          else { applyAudioRoute(); player.pause(); }
+        } else if (msg.type === 'MUTE') {
+          window.__yaleAudioSource = 'native';
+          forceVideoMuted();
         } else if (msg.type === 'PLAY') {
-          player.play().catch(function() {});
+          window.__yalePlaying = true;
+          playVideoForRoute();
         } else if (msg.type === 'PAUSE') {
+          window.__yalePlaying = false;
+          applyAudioRoute();
           player.pause();
         } else if (msg.type === 'SEEK') {
           if (Math.abs(player.currentTime - msg.time) > 0.5) player.currentTime = msg.time;
           postTimeTick();
         } else if (msg.type === 'GET_TIME') {
           postTimeTick();
+        } else if (msg.type === 'KEEP_ALIVE') {
+          applyAudioRoute();
+          if (typeof msg.time === 'number' && msg.time >= 0) player.currentTime = msg.time;
+          if (msg.playing !== undefined) window.__yalePlaying = msg.playing !== false;
+          if (window.__yalePlaying && (player.paused || player.ended)) playVideoForRoute();
+          else if (!window.__yalePlaying && !player.paused) { applyAudioRoute(); player.pause(); }
         }
       } catch (err) {}
     }
 
-    document.addEventListener('message', (e) => handleMessage(e.data));
-    window.addEventListener('message', (e) => handleMessage(e.data));
+    document.addEventListener('visibilitychange', function() {
+      applyAudioRoute();
+      if (document.hidden) return;
+      if (window.__yalePlaying && player.paused) playVideoForRoute();
+      else if (!window.__yalePlaying && !player.paused) player.pause();
+    });
+
+    setInterval(function() {
+      if (window.__yaleAudioSource === 'native') forceVideoMuted();
+    }, 800);
+
+    document.addEventListener('message', function(e) { handleMessage(e.data); });
+    window.addEventListener('message', function(e) { handleMessage(e.data); });
+    window.__yaleDispatch = function(data) { handleMessage(data); };
   </script>
 </body>
 </html>`
 };
 
 const Room = ({ roomId, user, onLeave }) => {
+  const appInBackgroundRef = useRef(false);
+  const playbackIntentRef = useRef(true);
+  const needsResyncRef = useRef(false);
+  const sessionResyncDoneRef = useRef(false);
+  const bgKeepaliveTimersRef = useRef([]);
+  const togglePlayRef = useRef(null);
+  const handleSeekRef = useRef(null);
+  const applyPlaybackStateRef = useRef(null);
+  const resyncPlaybackFromServerRef = useRef(null);
+  const dispatchPlayerRef = useRef(() => {});
+
   const [roomData, setRoomData] = useState(null);
   const [participants, setParticipants] = useState([]);
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
   const [playerReady, setPlayerReady] = useState(false);
+  const [streamError, setStreamError] = useState(null);
+  const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
   const [playing, setPlaying] = useState(true);
 
   const isHost = user?.username === roomData?.creador;
@@ -187,6 +290,7 @@ const Room = ({ roomId, user, onLeave }) => {
   const [activeReactionMenuId, setActiveReactionMenuId] = useState(null);
   const [typingUsers, setTypingUsers] = useState([]);
   const [showMiniBrowser, setShowMiniBrowser] = useState(false);
+  const [miniBrowserPlatform, setMiniBrowserPlatform] = useState('browser');
   const [showYtBrowser, setShowYtBrowser] = useState(false);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showParticipants, setShowParticipants] = useState(false);
@@ -202,47 +306,29 @@ const Room = ({ roomId, user, onLeave }) => {
   const progressBarWidthRef = useRef(0);
   const hideControlsTimerRef = useRef(null);
   const controlsOpacity = useRef(new Animated.Value(1)).current;
-  const progressAnim = useRef(new Animated.Value(0)).current;
   const lastUiTimeRef = useRef(0);
   const isHostRef = useRef(false);
   const appStateRef = useRef(AppState.currentState);
+
+  /** YouTube: una sola fuente — WebView en primer plano, nativo en segundo plano. */
+  const shouldUseNativeYoutubeAudio = useCallback(() => {
+    if (youtubeDirectModeRef.current) return false;
+    if (appInBackgroundRef.current) return true;
+    const state = AppState.currentState;
+    return state === 'background' || state === 'inactive';
+  }, []);
 
   useEffect(() => {
     isHostRef.current = user?.username === roomData?.creador;
   }, [user?.username, roomData?.creador]);
 
-  // 🔵 SEGUNDO PLANO: AppState — detectar cuando la app va al fondo y vuelve
-  useEffect(() => {
-    if (!roomId || !user) return;
-
-    const subscription = AppState.addEventListener('change', (nextState) => {
-      const prevState = appStateRef.current;
-      appStateRef.current = nextState;
-
-      if (nextState === 'active' && prevState !== 'active') {
-        // Volvió al primer plano → re-unirse a la sala si el socket está conectado
-        console.log('📱 App volvió al primer plano. Re-uniéndose a la sala...');
-        if (socket.connected) {
-          socket.emit('join-room', { roomId, user });
-        } else {
-          // Si el socket no está conectado, esperar a que se reconecte
-          socket.connect();
-        }
-      } else if (nextState === 'background') {
-        console.log('📱 App fue al segundo plano. La sala sigue activa en el servidor.');
-        // NO emitir leave-room — el servidor tiene 45s de debounce
-      }
-    });
-
-    return () => subscription.remove();
-  }, [roomId, user]);
-
-  // 🔵 SEGUNDO PLANO: socket reconnect — re-unirse automáticamente
+  // 🔵 Reconexión de socket — re-unirse y marcar resync completo al recibir room-state
   useEffect(() => {
     if (!roomId || !user) return;
 
     const handleReconnect = () => {
       console.log('🔄 Socket reconectado. Re-uniéndose a la sala:', roomId);
+      needsResyncRef.current = true;
       socket.emit('join-room', { roomId, user });
     };
 
@@ -251,6 +337,7 @@ const Room = ({ roomId, user, onLeave }) => {
       socket.io.off('reconnect', handleReconnect);
     };
   }, [roomId, user]);
+
 
   const hidePlayerControls = useCallback(() => {
     if (hideControlsTimerRef.current) {
@@ -270,19 +357,6 @@ const Room = ({ roomId, user, onLeave }) => {
     controlsOpacity.setValue(1);
     hideControlsTimerRef.current = setTimeout(hidePlayerControls, CONTROLS_HIDE_MS);
   }, [controlsOpacity, hidePlayerControls]);
-
-  useEffect(() => {
-    const pct = videoDuration > 0 ? Math.min(1, displayTime / videoDuration) : 0;
-    if (isHostRef.current) {
-      Animated.timing(progressAnim, {
-        toValue: pct,
-        duration: 100,
-        useNativeDriver: false,
-      }).start();
-    } else {
-      progressAnim.setValue(pct);
-    }
-  }, [displayTime, videoDuration, progressAnim]);
 
   useEffect(() => {
     return () => {
@@ -1424,6 +1498,12 @@ const Room = ({ roomId, user, onLeave }) => {
   `;
 
   const processingVideoIdRef = useRef(null);
+  const isAddingToQueueRef = useRef(false);
+  const showYtBrowserRef = useRef(false);
+
+  useEffect(() => {
+    showYtBrowserRef.current = showYtBrowser;
+  }, [showYtBrowser]);
 
   const handleYtMessage = (event) => {
     try {
@@ -1434,17 +1514,17 @@ const Room = ({ roomId, user, onLeave }) => {
         if (processingVideoIdRef.current === videoId) return;
         processingVideoIdRef.current = videoId;
 
+        // Cerrar el navegador al instante para que no suene ni pause la sala
+        setShowYtBrowser(false);
+
         const thumbnail = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
-        // Use server-side Innertube to get real title
         fetch(`${API_BASE_URL}/api/youtube/info/${videoId}`)
           .then(r => r.json())
           .then(info => {
             const titulo = (info && info.titulo && info.titulo.trim()) ? info.titulo.trim() : `Video ${videoId}`;
-            setShowYtBrowser(false);
             handleSelectVideo({ id: videoId, titulo, miniatura: info.miniatura || thumbnail });
           })
           .catch(() => {
-            setShowYtBrowser(false);
             handleSelectVideo({ id: videoId, titulo: `Video ${videoId}`, miniatura: thumbnail });
           })
           .finally(() => {
@@ -1458,30 +1538,496 @@ const Room = ({ roomId, user, onLeave }) => {
   };
 
   const webViewRef = useRef(null);
+  const youtubePlayerRef = useRef(null);
+  const youtubeDirectModeRef = useRef(YOUTUBE_DIRECT_PLAYBACK);
   const localCurrentTime = useRef(0);
   const chatInputRef = useRef(null);
   const joinTime = useRef(Date.now());
   const isLeavingRef = useRef(false);
   const prevCreatorRef = useRef(null);
   const streamLoadedForIdRef = useRef(null);
+  const playerHtmlReadyRef = useRef(false);
+  const pendingStreamVideoRef = useRef(null);
+  const streamRetryRef = useRef({});
   const roomDataRef = useRef(null);
+  const queueRef = useRef([]);
   const lastGuestPlaySyncRef = useRef(null);
 
   useEffect(() => {
-    roomDataRef.current = roomData;
+    roomDataRef.current = roomData
+      ? { ...roomData, queue: queueRef.current }
+      : null;
   }, [roomData]);
+
+  useEffect(() => {
+    queueRef.current = Array.isArray(queue) ? queue : [];
+    if (roomDataRef.current) {
+      roomDataRef.current = { ...roomDataRef.current, queue: queueRef.current };
+    }
+  }, [queue]);
+
+  const dispatchToHtmlPlayer = useCallback((payload) => {
+    if (!webViewRef.current) return;
+    const raw = JSON.stringify(payload);
+    webViewRef.current.postMessage(raw);
+    webViewRef.current.injectJavaScript(
+      `(function(){try{if(window.__yaleDispatch){window.__yaleDispatch(${JSON.stringify(raw)});}}catch(e){}})();true;`
+    );
+  }, []);
+
+  useEffect(() => {
+    dispatchPlayerRef.current = dispatchToHtmlPlayer;
+  }, [dispatchToHtmlPlayer]);
+
+  const clearBgKeepaliveTimers = useCallback(() => {
+    bgKeepaliveTimersRef.current.forEach((id) => clearTimeout(id));
+    bgKeepaliveTimersRef.current = [];
+  }, []);
+
+  const scheduleBgKeepalive = useCallback(
+    (pos) => {
+      clearBgKeepaliveTimers();
+      if (!playbackIntentRef.current) return;
+      [300, 1000].forEach((ms) => {
+        const id = setTimeout(() => {
+          if (!appInBackgroundRef.current || !playbackIntentRef.current) return;
+          const track = roomDataRef.current?.video_actual;
+          if (!track?.id || track.id === 'browser_sync' || track.state !== 'PLAYING') {
+            return;
+          }
+          keepNativePlaying(localCurrentTime.current || pos);
+        }, ms);
+        bgKeepaliveTimersRef.current.push(id);
+      });
+    },
+    [clearBgKeepaliveTimers]
+  );
+
+  /** Una sola fuente de audio: WebView (primer plano) o nativo (segundo plano). */
+  const applyPlaybackState = useCallback(
+    async (shouldPlay, positionSec = localCurrentTime.current) => {
+      playbackIntentRef.current = shouldPlay;
+      clearBgKeepaliveTimers();
+
+      const track = roomDataRef.current?.video_actual;
+      const pos = Number.isFinite(positionSec) ? positionSec : localCurrentTime.current || 0;
+      localCurrentTime.current = pos;
+
+      setPlaying(shouldPlay);
+
+      if (!track?.id) return;
+
+      if (youtubeDirectModeRef.current && track.id !== 'browser_sync') {
+        setRoomData((prev) => {
+          if (!prev?.video_actual) return prev;
+          return {
+            ...prev,
+            video_actual: {
+              ...prev.video_actual,
+              state: shouldPlay ? 'PLAYING' : 'PAUSED',
+              currentTime: pos,
+              lastUpdate: Date.now(),
+            },
+          };
+        });
+        youtubePlayerRef.current?.seekTo(pos, true);
+        await updateMediaSession({
+          title: track.titulo || 'Yale',
+          artist: roomDataRef.current?.creador
+            ? `en sala de ${roomDataRef.current.creador}`
+            : 'Yale',
+          artworkUri: track.miniatura,
+          isPlaying: shouldPlay,
+          positionSec: pos,
+          durationSec: videoDuration,
+        });
+        return;
+      }
+
+      if (track.id === 'browser_sync') {
+        await stopNativeStream();
+        await updateMediaSession({
+          title: track.titulo || 'Yale',
+          artist: roomDataRef.current?.creador
+            ? `en sala de ${roomDataRef.current.creador}`
+            : 'Yale',
+          artworkUri: track.miniatura,
+          isPlaying: shouldPlay,
+          positionSec: pos,
+          durationSec: 0,
+        });
+        dispatchPlayerRef.current({ type: 'SYNC', time: pos, playing: shouldPlay });
+        dispatchPlayerRef.current({ type: 'VIDEO_PLAY', time: pos, playing: shouldPlay });
+        if (!shouldPlay) {
+          dispatchPlayerRef.current({ type: 'PAUSE' });
+        }
+        return;
+      }
+
+      setRoomData((prev) => {
+        if (!prev?.video_actual) return prev;
+        return {
+          ...prev,
+          video_actual: {
+            ...prev.video_actual,
+            state: shouldPlay ? 'PLAYING' : 'PAUSED',
+            currentTime: pos,
+            lastUpdate: Date.now(),
+          },
+        };
+      });
+
+      const streamUrl = buildStreamUrl(track.id);
+      const nativeAudio = shouldUseNativeYoutubeAudio();
+
+      if (nativeAudio) {
+        dispatchPlayerRef.current({ type: 'SET_AUDIO_SOURCE', source: 'native' });
+        dispatchPlayerRef.current({ type: 'MUTE' });
+        if (shouldPlay) {
+          await ensureStreamPlayback({ streamUrl, positionSec: pos, shouldPlay: true });
+          dispatchPlayerRef.current({ type: 'SYNC', time: pos, playing: true });
+          dispatchPlayerRef.current({ type: 'VIDEO_PLAY', time: pos, playing: true });
+        } else {
+          await pauseNativeStream();
+          dispatchPlayerRef.current({ type: 'SYNC', time: pos, playing: false });
+          dispatchPlayerRef.current({ type: 'PAUSE' });
+        }
+      } else {
+        await stopNativeStream();
+        dispatchPlayerRef.current({ type: 'SET_AUDIO_SOURCE', source: 'webview' });
+        if (shouldPlay) {
+          dispatchPlayerRef.current({ type: 'SYNC', time: pos, playing: true });
+          dispatchPlayerRef.current({ type: 'VIDEO_PLAY', time: pos, playing: true });
+        } else {
+          dispatchPlayerRef.current({ type: 'SYNC', time: pos, playing: false });
+          dispatchPlayerRef.current({ type: 'PAUSE' });
+        }
+      }
+
+      await updateMediaSession({
+        title: track.titulo || 'Yale',
+        artist: roomDataRef.current?.creador
+          ? `en sala de ${roomDataRef.current.creador}`
+          : 'Yale',
+        artworkUri: track.miniatura,
+        isPlaying: shouldPlay,
+        positionSec: pos,
+        durationSec: videoDuration,
+      });
+    },
+    [clearBgKeepaliveTimers, videoDuration, shouldUseNativeYoutubeAudio]
+  );
+
+  useEffect(() => {
+    applyPlaybackStateRef.current = applyPlaybackState;
+  }, [applyPlaybackState]);
+
+  const syncVideoToNativePositionRef = useRef(async () => {});
+
+  useEffect(() => {
+    if (!roomId || !user) return;
+
+    initMediaSession({
+      onPlayPress: () => {
+        const t = localCurrentTime.current;
+        if (isHostRef.current) {
+          if (playbackIntentRef.current) return;
+          socket.emit('video-state-change', {
+            roomId,
+            state: 'PLAYING',
+            currentTime: t,
+          });
+          applyPlaybackStateRef.current?.(true, t);
+        } else {
+          applyPlaybackStateRef.current?.(true, t);
+        }
+      },
+      onPausePress: () => {
+        const t = localCurrentTime.current;
+        if (isHostRef.current) {
+          if (!playbackIntentRef.current) return;
+          socket.emit('video-state-change', {
+            roomId,
+            state: 'PAUSED',
+            currentTime: t,
+          });
+          applyPlaybackStateRef.current?.(false, t);
+        } else {
+          applyPlaybackStateRef.current?.(false, t);
+        }
+      },
+      onSeek: (position) => {
+        if (isHostRef.current) handleSeekRef.current?.(position);
+      },
+      onStatus: ({ positionSec, durationSec, isPlaying }) => {
+        const track = roomDataRef.current?.video_actual;
+        if (!track?.id || track.id === 'browser_sync') return;
+        if (!shouldUseNativeYoutubeAudio()) return;
+        if (!playbackIntentRef.current && !isPlaying) return;
+
+        localCurrentTime.current = positionSec;
+        if (Math.abs(positionSec - lastUiTimeRef.current) >= 0.08) {
+          lastUiTimeRef.current = positionSec;
+          setDisplayTime(positionSec);
+        }
+        if (durationSec > 0) setVideoDuration(durationSec);
+        if (track?.titulo) {
+          updateMediaSession({
+            title: track.titulo,
+            artist: roomDataRef.current?.creador
+              ? `en sala de ${roomDataRef.current.creador}`
+              : 'Yale',
+            artworkUri: track.miniatura,
+            durationSec,
+            positionSec,
+            isPlaying: playbackIntentRef.current,
+          });
+        }
+      },
+    });
+
+    return () => {
+      clearBgKeepaliveTimers();
+      teardownMediaSession();
+    };
+  }, [roomId, user, clearBgKeepaliveTimers]);
+
+  useEffect(() => {
+    if (!roomId || !user) return;
+
+    const subscription = AppState.addEventListener('change', async (nextState) => {
+      const prevState = appStateRef.current;
+      appStateRef.current = nextState;
+
+      if (nextState === 'active' && prevState !== 'active') {
+        appInBackgroundRef.current = false;
+        if (socket.connected) {
+          socket.emit('join-room', { roomId, user });
+        } else {
+          socket.connect();
+        }
+        const track = roomDataRef.current?.video_actual;
+        if (track?.id && track.id !== 'browser_sync') {
+          const nativePos = await getStreamPositionSec();
+          const pos =
+            nativePos != null ? nativePos : localCurrentTime.current || 0;
+          await stopNativeStream();
+          await applyPlaybackStateRef.current?.(
+            playbackIntentRef.current,
+            pos
+          );
+        } else {
+          await syncVideoToNativePositionRef.current();
+        }
+      } else if (nextState === 'background' || nextState === 'inactive') {
+        appInBackgroundRef.current = true;
+        appStateRef.current = nextState;
+        const track = roomDataRef.current?.video_actual;
+        if (
+          track?.id &&
+          track.id !== 'browser_sync' &&
+          playbackIntentRef.current
+        ) {
+          const pos = localCurrentTime.current || getCalculatedVideoTime(track);
+          await applyPlaybackStateRef.current?.(true, pos);
+          scheduleBgKeepalive(pos);
+        }
+      }
+    });
+
+    return () => subscription.remove();
+  }, [roomId, user]);
+
+  const progressBucket = Math.floor(displayTime);
+
+  useEffect(() => {
+    const track = roomData?.video_actual;
+    if (!track?.id) return;
+    updateMediaSession({
+      title: track.titulo || 'Reproduciendo',
+      artist: roomData?.creador ? `en sala de ${roomData.creador}` : 'Yale',
+      artworkUri: track.miniatura,
+      isPlaying: playing,
+      positionSec: displayTime,
+      durationSec: track.id === 'browser_sync' ? 0 : videoDuration,
+    });
+  }, [
+    roomData?.video_actual?.id,
+    roomData?.video_actual?.titulo,
+    roomData?.video_actual?.miniatura,
+    roomData?.creador,
+    playing,
+    progressBucket,
+    videoDuration,
+  ]);
+
+  const loadYoutubeDirect = useCallback((videoActual) => {
+    if (!videoActual?.id || videoActual.id === 'browser_sync') return;
+    const videoId = videoActual.id;
+    if (streamLoadedForIdRef.current === videoId && playerReady) return;
+
+    youtubeDirectModeRef.current = true;
+    const startTime = getCalculatedVideoTime(videoActual);
+    const shouldPlay = videoActual.state === 'PLAYING';
+
+    console.log(`▶️ YouTube directo (sin servidor): ${videoId} @ ${startTime.toFixed(1)}s`);
+    setStreamError(null);
+    streamLoadedForIdRef.current = videoId;
+    streamRetryRef.current[videoId] = 0;
+    localCurrentTime.current = startTime;
+    setDisplayTime(startTime);
+    playbackIntentRef.current = shouldPlay;
+    setPlaying(shouldPlay);
+    setPlayerReady(true);
+    setNeedsAudioUnlock(false);
+
+    setTimeout(() => {
+      youtubePlayerRef.current?.seekTo(startTime, true);
+    }, 600);
+  }, []);
+
+  const loadYoutubeStream = useCallback(
+    async (videoActual, isRetry = false, autoRetryAttempt = 0) => {
+      if (!videoActual?.id || videoActual.id === 'browser_sync') return;
+
+      if (youtubeDirectModeRef.current || YOUTUBE_DIRECT_PLAYBACK) {
+        loadYoutubeDirect(videoActual);
+        return;
+      }
+
+      const videoId = videoActual.id;
+
+      if (!isRetry && streamLoadedForIdRef.current === videoId) return;
+
+      const cacheBust = isRetry ? `&_retry=${Date.now()}` : '';
+      const proxyUrl = `${API_BASE_URL}/api/youtube/stream?videoId=${encodeURIComponent(videoId)}${cacheBust}`;
+      const startTime = getCalculatedVideoTime(videoActual);
+      const shouldPlay = videoActual.state === 'PLAYING';
+
+      const scheduleAutoRetry = (reason) => {
+        if (autoRetryAttempt >= PLAYBACK_SYNC.STREAM_MAX_AUTO_RETRIES) {
+          setStreamError(
+            'No se pudo cargar el video. Comprueba tu conexión y pulsa Reintentar.'
+          );
+          setPlayerReady(false);
+          return;
+        }
+        const delay =
+          PLAYBACK_SYNC.STREAM_RETRY_DELAYS_MS[autoRetryAttempt] ?? 6000;
+        setStreamError(
+          `${reason} Reintentando (${autoRetryAttempt + 1}/${PLAYBACK_SYNC.STREAM_MAX_AUTO_RETRIES})…`
+        );
+        setPlayerReady(false);
+        setTimeout(() => {
+          const current = roomDataRef.current?.video_actual;
+          if (current?.id === videoId) {
+            loadYoutubeStream(current, true, autoRetryAttempt + 1);
+          }
+        }, delay);
+      };
+
+      const sendLoad = () => {
+        console.log(`📡 Cargando stream Yale: ${videoId} @ ${startTime.toFixed(2)}s`);
+        setStreamError(null);
+        streamRetryRef.current[videoId] = 0;
+        dispatchToHtmlPlayer({
+          type: 'LOAD',
+          url: proxyUrl,
+          autoplay: shouldPlay,
+          startTime,
+        });
+        syncWebViewPlayback(videoActual, isHostRef.current, shouldPlay);
+      };
+
+      try {
+        const probe = await fetch(proxyUrl, {
+          headers: { Range: 'bytes=0-2047' },
+        });
+        if (!probe.ok && probe.status !== 206) {
+          let detail = `El servidor respondió HTTP ${probe.status}`;
+          try {
+            const errBody = await probe.json();
+            if (errBody?.message) detail = errBody.message;
+          } catch (_) {}
+          throw new Error(detail);
+        }
+      } catch (err) {
+        const msg = err?.message || 'No se pudo conectar al stream';
+        console.error('❌ Stream probe failed:', msg, proxyUrl);
+        scheduleAutoRetry(msg);
+        return;
+      }
+
+      if (playerHtmlReadyRef.current && webViewRef.current) {
+        sendLoad();
+      } else {
+        pendingStreamVideoRef.current = videoActual;
+      }
+    },
+    [dispatchToHtmlPlayer, loadYoutubeDirect]
+  );
+
+  const resyncPlaybackFromServer = useCallback(
+    async (roomState) => {
+      const data = roomState || roomDataRef.current;
+      const track = data?.video_actual;
+      if (!track?.id || track.id === 'browser_sync') return;
+
+      const serverPos = getCalculatedVideoTime(track);
+      const nativePos = await getStreamPositionSec();
+      const pos =
+        nativePos != null &&
+        Math.abs(nativePos - serverPos) <= PLAYBACK_SYNC.DRIFT_SEC
+          ? nativePos
+          : serverPos;
+      const shouldPlay = track.state === 'PLAYING';
+
+      playbackIntentRef.current = shouldPlay;
+      setPlaying(shouldPlay);
+      localCurrentTime.current = pos;
+      setDisplayTime(pos);
+
+      const needsReload =
+        !playerReady ||
+        !!streamError ||
+        streamLoadedForIdRef.current !== track.id;
+
+      if (needsReload) {
+        streamLoadedForIdRef.current = null;
+        loadYoutubeStream(track, true);
+        return;
+      }
+
+      isInternalChange.current = true;
+      try {
+        await applyPlaybackStateRef.current?.(shouldPlay, pos);
+      } finally {
+        setTimeout(() => {
+          isInternalChange.current = false;
+        }, 700);
+      }
+    },
+    [playerReady, streamError, loadYoutubeStream]
+  );
+
+  useEffect(() => {
+    resyncPlaybackFromServerRef.current = resyncPlaybackFromServer;
+    syncVideoToNativePositionRef.current = async () => {
+      await resyncPlaybackFromServerRef.current?.(roomDataRef.current);
+    };
+  }, [resyncPlaybackFromServer]);
 
   const playerRef = useRef({
     getCurrentTime: () => {
       return Promise.resolve(localCurrentTime.current);
     },
-    seekTo: (time, allowSeekAhead) => {
+    seekTo: (time) => {
       webViewRef.current?.postMessage(JSON.stringify({ type: 'SEEK', time }));
     }
   });
 
   const postSyncToWebView = (videoActual, shouldPlay) => {
-    if (!webViewRef.current || !videoActual) return;
+    if (!videoActual || !webViewRef.current) return;
     webViewRef.current.postMessage(JSON.stringify({
       type: 'SYNC',
       time: getCalculatedVideoTime(videoActual),
@@ -1490,7 +2036,7 @@ const Room = ({ roomId, user, onLeave }) => {
   };
 
   const syncWebViewPlayback = (videoActual, hostFlag, shouldPlay) => {
-    if (!webViewRef.current || !videoActual) return;
+    if (!videoActual || !webViewRef.current) return;
     webViewRef.current.postMessage(JSON.stringify({
       type: 'SET_ROLE',
       isHost: hostFlag,
@@ -1524,16 +2070,15 @@ const Room = ({ roomId, user, onLeave }) => {
     if (!isHost || !roomData?.video_actual?.id) return;
     bumpPlayerControls();
     const clamped = Math.max(0, Math.min(time, videoDuration || time));
-    localCurrentTime.current = clamped;
-    setDisplayTime(clamped);
     isInternalChange.current = true;
-    webViewRef.current?.postMessage(JSON.stringify({ type: 'SEEK', time: clamped }));
+    const shouldPlay = playbackIntentRef.current;
     socket.emit('video-seek', { roomId, currentTime: clamped });
     socket.emit('video-state-change', {
       roomId,
-      state: playing ? 'PLAYING' : 'PAUSED',
+      state: shouldPlay ? 'PLAYING' : 'PAUSED',
       currentTime: clamped
     });
+    applyPlaybackState(shouldPlay, clamped);
     setTimeout(() => { isInternalChange.current = false; }, 400);
   };
 
@@ -1546,25 +2091,16 @@ const Room = ({ roomId, user, onLeave }) => {
     const serverTime = getCalculatedVideoTime(data.video_actual);
     const drift = Math.abs(localCurrentTime.current - serverTime);
 
-    if (!webViewRef.current) return;
-
-    if (drift > GUEST_SYNC_DRIFT_THRESHOLD) {
+    if (drift > PLAYBACK_SYNC.DRIFT_SEC) {
       isInternalChange.current = true;
-      localCurrentTime.current = serverTime;
-      webViewRef.current.postMessage(JSON.stringify({
-        type: 'SYNC',
-        time: serverTime,
-        playing: shouldPlay
-      }));
+      playbackIntentRef.current = shouldPlay;
+      applyPlaybackStateRef.current?.(shouldPlay, serverTime);
       setTimeout(() => { isInternalChange.current = false; }, 400);
       lastGuestPlaySyncRef.current = shouldPlay;
     } else if (lastGuestPlaySyncRef.current !== shouldPlay) {
       isInternalChange.current = true;
-      webViewRef.current.postMessage(JSON.stringify({
-        type: 'SYNC',
-        time: serverTime,
-        playing: shouldPlay
-      }));
+      playbackIntentRef.current = shouldPlay;
+      applyPlaybackStateRef.current?.(shouldPlay, serverTime);
       setTimeout(() => { isInternalChange.current = false; }, 300);
       lastGuestPlaySyncRef.current = shouldPlay;
     }
@@ -1576,8 +2112,28 @@ const Room = ({ roomId, user, onLeave }) => {
       if (msg.type === 'CONSOLE_LOG') {
         console.log("📱 [Room WebView Console]:", msg.message);
       } else if (msg.type === 'PLAYING') {
+        setNeedsAudioUnlock(false);
+        if (
+          !playbackIntentRef.current &&
+          roomDataRef.current?.video_actual?.id !== 'browser_sync'
+        ) {
+          if (shouldUseNativeYoutubeAudio()) pauseNativeStream();
+          dispatchPlayerRef.current({ type: 'PAUSE' });
+          if (shouldUseNativeYoutubeAudio()) dispatchPlayerRef.current({ type: 'MUTE' });
+          dispatchPlayerRef.current({
+            type: 'SYNC',
+            time: localCurrentTime.current,
+            playing: false,
+          });
+          return;
+        }
         onPlayerStateChange('playing');
       } else if (msg.type === 'PAUSED') {
+        const appBg =
+          appInBackgroundRef.current || AppState.currentState !== 'active';
+        if (appBg && roomDataRef.current?.video_actual?.id !== 'browser_sync') {
+          return;
+        }
         onPlayerStateChange('paused');
       } else if (msg.type === 'ENDED') {
         onPlayerStateChange('ended');
@@ -1585,8 +2141,13 @@ const Room = ({ roomId, user, onLeave }) => {
         const t = typeof msg.time === 'number' ? msg.time : 0;
         localCurrentTime.current = t;
         const isBrowser = roomDataRef.current?.video_actual?.id === 'browser_sync';
-        if (isHostRef.current || isBrowser) {
-          setDisplayTime(t);
+        const useWebviewClock =
+          isBrowser || !shouldUseNativeYoutubeAudio();
+        if (useWebviewClock) {
+          if (Math.abs(t - lastUiTimeRef.current) >= 0.08) {
+            lastUiTimeRef.current = t;
+            setDisplayTime(t);
+          }
         }
         if (msg.duration && Number.isFinite(msg.duration) && msg.duration > 0) {
           setVideoDuration(msg.duration);
@@ -1595,8 +2156,49 @@ const Room = ({ roomId, user, onLeave }) => {
         if (msg.duration && Number.isFinite(msg.duration)) {
           setVideoDuration(msg.duration);
         }
+      } else if (msg.type === 'LOADED') {
+        const vid = roomDataRef.current?.video_actual?.id;
+        const track = roomDataRef.current?.video_actual;
+        if (vid && vid !== 'browser_sync') {
+          streamLoadedForIdRef.current = vid;
+          streamRetryRef.current[vid] = 0;
+        }
+        setStreamError(null);
+        setPlayerReady(true);
+        if (msg.duration && Number.isFinite(msg.duration) && msg.duration > 0) {
+          setVideoDuration(msg.duration);
+        }
+        const pos = typeof msg.time === 'number' ? msg.time : 0;
+        localCurrentTime.current = pos;
+        setDisplayTime(pos);
+        const shouldPlay = track?.state === 'PLAYING';
+        playbackIntentRef.current = shouldPlay;
+        if (vid && vid !== 'browser_sync') {
+          applyPlaybackStateRef.current?.(shouldPlay, pos);
+        }
+        setNeedsAudioUnlock(false);
       } else if (msg.type === 'ERROR') {
-        console.warn("🚨 [WebView HTML Video Element Error Code]:", msg.code);
+        const vid = roomDataRef.current?.video_actual?.id;
+        console.warn("🚨 [WebView HTML Video Error]:", msg.code, msg.src || '');
+        streamLoadedForIdRef.current = null;
+        setPlayerReady(false);
+        const attempt = streamRetryRef.current[vid] || 0;
+        if (vid && attempt < PLAYBACK_SYNC.STREAM_MAX_AUTO_RETRIES) {
+          streamRetryRef.current[vid] = attempt + 1;
+          const delay =
+            PLAYBACK_SYNC.STREAM_RETRY_DELAYS_MS[attempt] ?? 6000;
+          setStreamError(
+            `Error de reproducción. Reintentando (${attempt + 1}/${PLAYBACK_SYNC.STREAM_MAX_AUTO_RETRIES})…`
+          );
+          setTimeout(() => {
+            const va = roomDataRef.current?.video_actual;
+            if (va?.id === vid) loadYoutubeStream(va, true, attempt + 1);
+          }, delay);
+        } else {
+          setStreamError(
+            `No se pudo reproducir el video (${msg.code || 'error'}). Pulsa Reintentar.`
+          );
+        }
       } else if (msg.type === 'PLAYER_TAP') {
         bumpPlayerControls();
       }
@@ -1605,30 +2207,27 @@ const Room = ({ roomId, user, onLeave }) => {
     }
   };
 
-  // Sincronizar play/pause hacia el WebView (YouTube stream; en sitios web usa reproductor nativo)
+  // Vigilante: invitados siguen el tiempo de la sala (solo mientras reproduce)
   useEffect(() => {
-    if (!playerReady || !webViewRef.current || isInternalChange.current) return;
-    if (roomDataRef.current?.video_actual?.id === 'browser_sync') return;
-    webViewRef.current.postMessage(JSON.stringify({ type: playing ? 'PLAY' : 'PAUSE' }));
-  }, [playing, playerReady]);
-
-  // Vigilante: invitados siguen el tiempo de la sala en tiempo real
-  useEffect(() => {
-    if (!playerReady) return;
+    if (!playerReady || !playing) return;
     applyGuestSync();
     const intervalMs = roomDataRef.current?.video_actual?.id === 'browser_sync'
-      ? 400
-      : GUEST_SYNC_INTERVAL_MS;
+      ? PLAYBACK_SYNC.GUEST_INTERVAL_BROWSER_MS
+      : PLAYBACK_SYNC.GUEST_INTERVAL_MS;
     const syncInterval = setInterval(applyGuestSync, intervalMs);
     return () => clearInterval(syncInterval);
-  }, [playerReady, applyGuestSync, roomData?.video_actual?.id]);
+  }, [playerReady, playing, applyGuestSync, roomData?.video_actual?.id]);
 
-  // Host envía posición periódica para que todos mantengan el mismo audio/video
+  // Host envía posición periódica (solo mientras reproduce — ahorra batería en pausa)
   useEffect(() => {
-    if (!isHost || !playerReady || !roomId) return;
-    const heartbeatMs = roomDataRef.current?.video_actual?.id === 'browser_sync' ? 800 : HOST_HEARTBEAT_MS;
+    if (!isHost || !playerReady || !roomId || !playing) return;
+    const heartbeatMs =
+      roomDataRef.current?.video_actual?.id === 'browser_sync'
+        ? PLAYBACK_SYNC.HOST_HEARTBEAT_BROWSER_MS
+        : PLAYBACK_SYNC.HOST_HEARTBEAT_MS;
     const heartbeat = setInterval(() => {
       if (isInternalChange.current || isLeavingRef.current) return;
+      if (!playbackIntentRef.current) return;
       socket.emit('video-state-change', {
         roomId,
         state: playing ? 'PLAYING' : 'PAUSED',
@@ -1652,9 +2251,22 @@ const Room = ({ roomId, user, onLeave }) => {
       );
       return () => timers.forEach(clearTimeout);
     }
+    if (youtubeDirectModeRef.current || YOUTUBE_DIRECT_PLAYBACK) {
+      const shouldPlay = roomData.video_actual.state === 'PLAYING';
+      const pos = getCalculatedVideoTime(roomData.video_actual);
+      applyPlaybackStateRef.current?.(shouldPlay, pos);
+      return;
+    }
+
     const delays = [0, 350, 900, 2000, 4000];
     const timers = delays.map((ms) =>
-      setTimeout(() => syncWebViewPlayback(roomData.video_actual, isHost, shouldPlay), ms)
+      setTimeout(() => {
+        const data = roomDataRef.current;
+        if (!data?.video_actual || data.video_actual.id === 'browser_sync') return;
+        const playNow =
+          playbackIntentRef.current && data.video_actual.state === 'PLAYING';
+        syncWebViewPlayback(data.video_actual, isHostRef.current, playNow);
+      }, ms)
     );
     return () => timers.forEach(clearTimeout);
   }, [playerReady, roomData?.video_actual?.id]);
@@ -1667,14 +2279,23 @@ const Room = ({ roomId, user, onLeave }) => {
       if (!data?.video_actual) return;
       const isHostUser = user?.username === data.creador;
       let t;
+      const isPaused =
+        !playbackIntentRef.current || data.video_actual.state !== 'PLAYING';
+      if (isPaused && data.video_actual.id !== 'browser_sync') {
+        return;
+      }
+
       if (data.video_actual.id === 'browser_sync') {
         t = localCurrentTime.current;
         webViewRef.current?.postMessage(JSON.stringify({ type: 'GET_TIME' }));
       } else if (isHostUser) {
-        t = localCurrentTime.current;
-        if (playing) {
-          webViewRef.current?.postMessage(JSON.stringify({ type: 'GET_TIME' }));
+        if (
+          data.video_actual.id !== 'browser_sync' &&
+          shouldUseNativeYoutubeAudio()
+        ) {
+          return;
         }
+        t = localCurrentTime.current;
       } else {
         t = data.video_actual.state === 'PLAYING'
           ? getCalculatedVideoTime(data.video_actual)
@@ -1689,7 +2310,6 @@ const Room = ({ roomId, user, onLeave }) => {
     return () => clearInterval(tick);
   }, [playerReady, roomData?.video_actual?.id, user?.username]);
 
-  // YouTube: mostrar controles al cargar. Navegador: ocultos hasta tocar el video.
   useEffect(() => {
     if (!playerReady || !roomData?.video_actual?.id) return;
     if (roomData.video_actual.id === 'browser_sync') {
@@ -1700,7 +2320,6 @@ const Room = ({ roomId, user, onLeave }) => {
     bumpPlayerControls();
   }, [playerReady, roomData?.video_actual?.id, bumpPlayerControls, controlsOpacity]);
 
-  // Restaurar orientación al salir de la sala o desmontar
   useEffect(() => {
     return () => {
       ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(() => {});
@@ -1708,7 +2327,6 @@ const Room = ({ roomId, user, onLeave }) => {
     };
   }, []);
 
-  // Cuando cambia el admin, mantener el video en marcha (no recargar WebView)
   useEffect(() => {
     if (!roomData?.creador || !playerReady) return;
     const videoId = roomData.video_actual?.id;
@@ -1726,7 +2344,6 @@ const Room = ({ roomId, user, onLeave }) => {
     prevCreatorRef.current = roomData.creador;
   }, [roomData?.creador, playerReady, isHost]);
 
-  // Mensaje en el chat de Estás viendo
   useEffect(() => {
     if (roomData?.video_actual?.titulo) {
       const currentTitle = roomData.video_actual.titulo;
@@ -1745,58 +2362,52 @@ const Room = ({ roomId, user, onLeave }) => {
     }
   }, [roomData?.video_actual?.titulo]);
 
-  // Actualizar controles de host en el WebView
   useEffect(() => {
-    if (!playerReady || !webViewRef.current) return;
-    webViewRef.current.postMessage(JSON.stringify({ type: 'SET_ROLE', isHost, playing }));
+    if (!playerReady || isInternalChange.current) return;
+    if (roomData?.video_actual?.id === 'browser_sync') {
+      webViewRef.current?.postMessage(JSON.stringify({ type: 'SET_ROLE', isHost, playing }));
+    }
   }, [isHost, playerReady]);
 
-  // Cuando cambie el video actual, marcar que el reproductor está listo y cargar el stream
+  const prevVideoModeRef = useRef(null);
+
   useEffect(() => {
-    if (roomData?.video_actual?.id) {
-      const videoId = roomData.video_actual.id;
+    if (!roomData?.video_actual?.id) return;
 
-      // Ya cargado: no volver a pedir el stream (evita pantalla negra al cambiar de admin)
-      if (videoId !== 'browser_sync' && streamLoadedForIdRef.current === videoId) {
-        return;
+    const videoId = roomData.video_actual.id;
+    const prevMode = prevVideoModeRef.current;
+    const nextMode = videoId === 'browser_sync' ? 'browser' : 'youtube';
+    prevVideoModeRef.current = nextMode;
+
+    if (prevMode && prevMode !== nextMode) {
+      stopNativeStream();
+      if (prevMode === 'browser') {
+        dispatchPlayerRef.current({ type: 'PAUSE' });
+        dispatchPlayerRef.current({ type: 'MUTE' });
       }
-
-      setVideoDuration(0);
-      setDisplayTime(0);
-      
-      if (videoId === 'browser_sync') {
-        setPlayerReady(true);
-        const shouldPlay = roomData.video_actual?.state === 'PLAYING';
-        syncWebViewPlayback(roomData.video_actual, isHost, shouldPlay);
-        [0, 500, 1200, 2500].forEach((ms) => setTimeout(postBrowserAutoStart, ms));
-        return;
-      }
-      
-      const fetchStream = async () => {
-        try {
-          const streamUrl = `${API_BASE_URL}/api/youtube/stream?videoId=${videoId}`;
-          console.log("🎉 Loading server proxy stream:", streamUrl);
-
-          const startTime = getCalculatedVideoTime(roomData.video_actual);
-          console.log(`⏱️ Starting mobile player at calculated seek time: ${startTime}s`);
-
-          webViewRef.current?.postMessage(JSON.stringify({ 
-            type: 'LOAD', 
-            url: streamUrl,
-            autoplay: playing,
-            startTime: startTime
-          }));
-          streamLoadedForIdRef.current = videoId;
-          setPlayerReady(true);
-          syncWebViewPlayback(roomData.video_actual, isHost, playing);
-        } catch (err) {
-          console.error("Error loading video stream in Room.js:", err.message);
-        }
-      };
-      
-      fetchStream();
     }
-  }, [roomData?.video_actual?.id]);
+
+    setVideoDuration(0);
+    setDisplayTime(0);
+
+    if (videoId === 'browser_sync') {
+      streamLoadedForIdRef.current = null;
+      playerHtmlReadyRef.current = false;
+      setPlayerReady(true);
+      setStreamError(null);
+      const shouldPlay = roomData.video_actual?.state === 'PLAYING';
+      playbackIntentRef.current = shouldPlay;
+      setPlaying(shouldPlay);
+      syncWebViewPlayback(roomData.video_actual, isHost, shouldPlay);
+      [0, 500, 1200, 2500].forEach((ms) => setTimeout(postBrowserAutoStart, ms));
+      return;
+    }
+
+    if (streamLoadedForIdRef.current !== videoId) {
+      setPlayerReady(false);
+      loadYoutubeStream(roomData.video_actual);
+    }
+  }, [roomData?.video_actual?.id, loadYoutubeStream, isHost]);
 
   const isInternalChange = useRef(false);
   const chatListRef = useRef(null);
@@ -1819,16 +2430,53 @@ const Room = ({ roomId, user, onLeave }) => {
     socket.emit('join-room', { roomId, user });
 
     const handleRoomState = (data) => {
+      const prevVideoId = roomDataRef.current?.video_actual?.id;
+      const nextVideoId = data.video_actual?.id;
+      if (
+        prevVideoId !== nextVideoId &&
+        (prevVideoId === 'browser_sync' || nextVideoId === 'browser_sync')
+      ) {
+        stopNativeStream();
+      }
+      if (nextVideoId && nextVideoId !== streamLoadedForIdRef.current) {
+        streamLoadedForIdRef.current = null;
+        setPlayerReady(false);
+      }
+      if (prevVideoId && nextVideoId && prevVideoId !== nextVideoId) {
+        setNeedsAudioUnlock(true);
+        needsResyncRef.current = true;
+        streamLoadedForIdRef.current = null;
+        setPlayerReady(false);
+        setVideoDuration(0);
+        setDisplayTime(0);
+        localCurrentTime.current = 0;
+        lastUiTimeRef.current = 0;
+        setTimeout(() => resyncPlaybackFromServerRef.current?.(data), 60);
+      }
       setRoomData(data);
       setParticipants(data.participantes || []);
-      setQueue(data.queue || []);
+      setQueue(Array.isArray(data.queue) ? data.queue : []);
       // Solo ocultar sugerencias si hay un video PLAYING activo.
       // Si llega PAUSED (video terminó, cola vacía), no interferir con las sugerencias.
       if (data.video_actual?.state === 'PLAYING') {
         setShowSuggestions(false);
       }
       if (data.video_actual?.state) {
-        setPlaying(data.video_actual.state === 'PLAYING');
+        const shouldPlay = data.video_actual.state === 'PLAYING';
+        playbackIntentRef.current = shouldPlay;
+        setPlaying(shouldPlay);
+      }
+
+      const shouldFullResync =
+        needsResyncRef.current || !sessionResyncDoneRef.current;
+      if (
+        shouldFullResync &&
+        data.video_actual?.id &&
+        data.video_actual.id !== 'browser_sync'
+      ) {
+        needsResyncRef.current = false;
+        sessionResyncDoneRef.current = true;
+        setTimeout(() => resyncPlaybackFromServerRef.current?.(data), 50);
       }
     };
 
@@ -1856,22 +2504,7 @@ const Room = ({ roomId, user, onLeave }) => {
 
       if (!isInternalChange.current) {
         isInternalChange.current = true;
-
-        if (webViewRef.current) {
-          webViewRef.current.postMessage(JSON.stringify({
-            type: 'SYNC',
-            time: currentTime,
-            playing: state === 'PLAYING'
-          }));
-        } else if (playerRef.current) {
-          playerRef.current.getCurrentTime().then(localTime => {
-            if (Math.abs(localTime - currentTime) > 2) {
-              playerRef.current.seekTo(currentTime, true);
-            }
-          }).catch(() => {});
-        }
-
-        setPlaying(state === 'PLAYING');
+        applyPlaybackStateRef.current?.(state === 'PLAYING', currentTime);
         setTimeout(() => { isInternalChange.current = false; }, 800);
       }
     };
@@ -1887,15 +2520,10 @@ const Room = ({ roomId, user, onLeave }) => {
         const shouldPlay = prev.video_actual.state === 'PLAYING';
         if (
           !isInternalChange.current &&
-          webViewRef.current &&
           user?.username !== prev.creador
         ) {
           isInternalChange.current = true;
-          webViewRef.current.postMessage(JSON.stringify({
-            type: 'SYNC',
-            time: currentTime,
-            playing: shouldPlay
-          }));
+          applyPlaybackStateRef.current?.(shouldPlay, currentTime);
           setTimeout(() => { isInternalChange.current = false; }, 350);
         }
         return {
@@ -1930,7 +2558,9 @@ const Room = ({ roomId, user, onLeave }) => {
 
     // Cola de reproducción
     const handleQueueUpdated = (newQueue) => {
-      setQueue(newQueue || []);
+      const cola = Array.isArray(newQueue) ? newQueue : [];
+      setQueue(cola);
+      console.log(`🎵 Cola actualizada (${cola.length} canciones)`);
     };
     const handleQueueEmpty = () => {
       setShowSuggestions(true);
@@ -1944,8 +2574,6 @@ const Room = ({ roomId, user, onLeave }) => {
     socket.on('queue-empty', handleQueueEmpty);
 
     return () => {
-      isLeavingRef.current = true;
-      socket.emit('leave-room');
       socket.off('room-state');
       socket.off('nuevo-participante');
       socket.off('participante-salio');
@@ -1983,6 +2611,21 @@ const Room = ({ roomId, user, onLeave }) => {
     const isHostUser = user?.username === roomData?.creador;
     const inBrowserMode = roomData.video_actual?.id === 'browser_sync';
 
+    const appBg = appInBackgroundRef.current || AppState.currentState !== 'active';
+    if (appBg && !inBrowserMode && (state === 'paused' || state === 'ended')) {
+      return;
+    }
+
+    // Ignorar pausas falsas al buscar en YouTube o al añadir a cola
+    if (
+      isHostUser &&
+      !inBrowserMode &&
+      (state === 'paused' || state === 'ended') &&
+      (isAddingToQueueRef.current || showYtBrowserRef.current)
+    ) {
+      return;
+    }
+
     // Ignorar actualizaciones espurias durante la carga inicial (solo stream YouTube)
     if (!inBrowserMode && Date.now() - joinTime.current < 2500) {
       return;
@@ -1994,6 +2637,9 @@ const Room = ({ roomId, user, onLeave }) => {
     }
 
     const mappedState = state === 'playing' ? 'PLAYING' : (state === 'paused' || state === 'ended') ? 'PAUSED' : null;
+    if (mappedState === 'PAUSED' && isAddingToQueueRef.current) {
+      return;
+    }
     if (mappedState) {
       const currentTime = localCurrentTime.current;
       setPlaying(mappedState === 'PLAYING');
@@ -2056,41 +2702,126 @@ const Room = ({ roomId, user, onLeave }) => {
 
 
 
+  const resumeMainPlayback = useCallback(() => {
+    const data = roomDataRef.current;
+    if (!data?.video_actual || data.video_actual.id === 'browser_sync') return;
+    if (data.video_actual.state !== 'PLAYING') return;
+
+    isInternalChange.current = true;
+    const t = getCalculatedVideoTime(data.video_actual);
+    applyPlaybackStateRef.current?.(true, t);
+    setTimeout(() => { isInternalChange.current = false; }, 600);
+  }, []);
+
+  // Encolar si ya hay algo reproduciéndose (YouTube PLAYING o Kick/navegador en vivo).
+  // La nueva pista solo suena cuando el admin pulsa adelantar.
+  const debeEncolar = () => {
+    const va = roomDataRef.current?.video_actual;
+    if (!va?.id || va.id === '') return false;
+    if (va.id === 'browser_sync') return true;
+    return va.state === 'PLAYING';
+  };
+
   const handleSelectVideo = (video) => {
     setShowSuggestions(false);
-    // Solo añadir a cola si hay un video PLAYING activamente.
-    // Si terminó (PAUSED/ENDED) o no hay video → reproducir directo.
-    const isCurrentlyPlaying =
-      roomData?.video_actual?.id &&
-      roomData.video_actual.id !== '' &&
-      roomData.video_actual.state === 'PLAYING';
+    setShowYtBrowser(false);
 
-    if (isCurrentlyPlaying) {
-      // Hay algo reproduciéndose → va a la cola
+    if (debeEncolar()) {
+      isAddingToQueueRef.current = true;
       socket.emit('add-to-queue', { roomId, video, username: user?.username });
-    } else {
-      // Nada reproduciéndose (terminó, pausado o sala vacía) → reproducir ahora
-      socket.emit('change-video', { roomId, video });
+      setQueue((prev) => [
+        ...prev,
+        {
+          queueId: `local-${Date.now()}`,
+          id: video.id,
+          titulo: video.titulo,
+          miniatura: video.miniatura || `https://img.youtube.com/vi/${video.id}/mqdefault.jpg`,
+          addedBy: user?.username || 'Tú',
+        },
+      ]);
+      const onKickOrBrowser =
+        roomDataRef.current?.video_actual?.id === 'browser_sync';
+      setTimeout(() => {
+        if (!onKickOrBrowser) {
+          resumeMainPlayback();
+        }
+        setTimeout(() => {
+          isAddingToQueueRef.current = false;
+        }, 1500);
+      }, onKickOrBrowser ? 0 : 350);
+      return;
     }
+
+    streamLoadedForIdRef.current = null;
+    playerHtmlReadyRef.current = true;
+    setPlayerReady(false);
+    setPlaying(true);
+    setStreamError(null);
+    socket.emit('change-video', { roomId, video });
   };
 
   const togglePlay = () => {
     if (!isHost) return;
     bumpPlayerControls();
-    const nextPlaying = !playing;
-    setPlaying(nextPlaying);
+    const nextPlaying = !playbackIntentRef.current;
     const currentTime = localCurrentTime.current;
     socket.emit('video-state-change', {
       roomId,
       state: nextPlaying ? 'PLAYING' : 'PAUSED',
       currentTime
     });
-    webViewRef.current?.postMessage(JSON.stringify({
-      type: 'SYNC',
-      time: currentTime,
-      playing: nextPlaying
-    }));
+    applyPlaybackState(nextPlaying, currentTime);
   };
+
+  const isKickPlayback = useCallback((videoActual) => {
+    if (!videoActual) return false;
+    return (
+      videoActual.browserPlatform === 'kick' ||
+      (videoActual.id === 'browser_sync' &&
+        typeof videoActual.browserUrl === 'string' &&
+        videoActual.browserUrl.includes('kick.com'))
+    );
+  }, []);
+
+  const handleSkipNext = useCallback(() => {
+    if (!isHostRef.current || !roomId) return;
+    bumpPlayerControls();
+
+    const hasQueue = queueRef.current.length > 0;
+
+    if (hasQueue) {
+      needsResyncRef.current = true;
+      socket.emit('skip-next', { roomId });
+      return;
+    }
+
+    const va = roomDataRef.current?.video_actual;
+    if (isKickPlayback(va)) return;
+
+    const t = localCurrentTime.current;
+    isInternalChange.current = true;
+    socket.emit('video-state-change', { roomId, state: 'PAUSED', currentTime: t });
+    applyPlaybackState(false, t);
+    setRoomData((prev) => {
+      if (!prev?.video_actual) return prev;
+      return {
+        ...prev,
+        video_actual: {
+          ...prev.video_actual,
+          state: 'PAUSED',
+          lastUpdate: Date.now(),
+        },
+      };
+    });
+    setTimeout(() => {
+      isInternalChange.current = false;
+    }, 400);
+  }, [roomId, bumpPlayerControls, applyPlaybackState, isKickPlayback]);
+
+  useEffect(() => {
+    togglePlayRef.current = togglePlay;
+    handleSeekRef.current = handleSeek;
+  });
 
   const confirmExit = () => {
     const isHost = user?.username === roomData?.creador;
@@ -2101,6 +2832,8 @@ const Room = ({ roomId, user, onLeave }) => {
         { text: "Cancelar", style: "cancel" },
         { text: "Sí, salir", style: "destructive", onPress: () => {
           isLeavingRef.current = true;
+          socket.emit('leave-room');
+          teardownMediaSession();
           onLeave();
         }}
       ]
@@ -2180,18 +2913,209 @@ const Room = ({ roomId, user, onLeave }) => {
       );
     }
 
+    const videoId = roomData.video_actual.id;
+    const startSec = Math.max(0, Math.floor(getCalculatedVideoTime(roomData.video_actual) || 0));
+    const { width: screenW, height: screenH } = Dimensions.get('window');
+
+    if (youtubeDirectModeRef.current || YOUTUBE_DIRECT_PLAYBACK) {
+      return (
+        <View style={{ width: '100%', height: '100%', backgroundColor: 'black', alignItems: 'center', justifyContent: 'center' }}>
+          <YoutubePlayer
+            key={`yt-${videoId}`}
+            ref={youtubePlayerRef}
+            height={Math.min(screenH * 0.42, 320)}
+            width={screenW}
+            play={playing}
+            videoId={videoId}
+            mute={false}
+            onReady={() => {
+              streamLoadedForIdRef.current = videoId;
+              setStreamError(null);
+              setPlayerReady(true);
+              setNeedsAudioUnlock(false);
+              youtubePlayerRef.current?.seekTo(startSec, true);
+            }}
+            onChangeState={onPlayerStateChange}
+            onProgress={(progress) => {
+              const t = progress?.currentTime ?? 0;
+              localCurrentTime.current = t;
+              if (Math.abs(t - lastUiTimeRef.current) >= 0.08) {
+                lastUiTimeRef.current = t;
+                setDisplayTime(t);
+              }
+              if (progress?.duration > 0) setVideoDuration(progress.duration);
+            }}
+            webViewProps={{
+              allowsInlineMediaPlayback: true,
+              mediaPlaybackRequiresUserAction: false,
+            }}
+            initialPlayerParams={{
+              start: startSec,
+              controls: false,
+              preventFullScreen: true,
+              modestbranding: true,
+              rel: 0,
+            }}
+          />
+          {!playerReady && roomData.video_actual?.miniatura && (
+            <View style={{ position: 'absolute', inset: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.85)' }}>
+              <ActivityIndicator size="large" color="#6366f1" />
+              <Text style={{ color: '#888', fontSize: 10, marginTop: 8, fontWeight: '700' }}>CARGANDO YOUTUBE...</Text>
+            </View>
+          )}
+        </View>
+      );
+    }
+
     return (
-      <WebView
-        ref={webViewRef}
-        source={HTML_PLAYER_SOURCE}
-        onMessage={handlePlayerMessage}
-        allowsInlineMediaPlayback={true}
-        mediaPlaybackRequiresUserAction={false}
-        domStorageEnabled={true}
-        javaScriptEnabled={true}
-        mixedContentMode="always"
-        style={{ width: '100%', height: '100%', backgroundColor: 'black' }}
-      />
+      <View style={{ width: '100%', height: '100%', backgroundColor: 'black' }}>
+        <WebView
+          ref={webViewRef}
+          source={HTML_PLAYER_SOURCE}
+          onMessage={handlePlayerMessage}
+          onLoadEnd={() => {
+            playerHtmlReadyRef.current = true;
+            const pending = pendingStreamVideoRef.current;
+            pendingStreamVideoRef.current = null;
+            if (pending?.id && pending.id !== 'browser_sync') {
+              loadYoutubeStream(pending);
+              return;
+            }
+            const vid = roomData?.video_actual?.id;
+            if (vid && vid !== 'browser_sync' && streamLoadedForIdRef.current !== vid) {
+              loadYoutubeStream(roomData.video_actual);
+            }
+          }}
+          allowsInlineMediaPlayback={true}
+          mediaPlaybackRequiresUserAction={false}
+          domStorageEnabled={true}
+          javaScriptEnabled={true}
+          mixedContentMode="always"
+          originWhitelist={['*']}
+          allowsFullscreenVideo={true}
+          style={{ width: '100%', height: '100%', backgroundColor: 'black' }}
+        />
+        {!playerReady && !streamError && roomData.video_actual?.miniatura && (
+          <View style={{ position: 'absolute', inset: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.85)' }}>
+            <Image source={{ uri: roomData.video_actual.miniatura }} style={{ width: '70%', height: '40%', opacity: 0.5, resizeMode: 'contain' }} />
+            <ActivityIndicator size="large" color="#6366f1" style={{ marginTop: 16 }} />
+            <Text style={{ color: '#888', fontSize: 10, marginTop: 8, fontWeight: '700', letterSpacing: 1 }}>CARGANDO VIDEO...</Text>
+          </View>
+        )}
+        {streamError && (
+          <View style={{ position: 'absolute', inset: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.9)', padding: 24 }}>
+            <Text style={{ color: '#f87171', fontSize: 12, fontWeight: '800', textAlign: 'center', marginBottom: 12 }}>{streamError}</Text>
+            <Text style={{ color: '#666', fontSize: 10, textAlign: 'center', marginBottom: 16 }}>{API_BASE_URL}</Text>
+            <TouchableOpacity
+              style={{ backgroundColor: '#6366f1', paddingHorizontal: 20, paddingVertical: 10, borderRadius: 12, marginBottom: 8 }}
+              onPress={() => loadYoutubeStream(roomData.video_actual, true)}
+            >
+              <Text style={{ color: '#fff', fontWeight: '800', fontSize: 12 }}>REINTENTAR SERVIDOR</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={{ backgroundColor: '#22c55e', paddingHorizontal: 20, paddingVertical: 10, borderRadius: 12 }}
+              onPress={() => loadYoutubeDirect(roomData.video_actual)}
+            >
+              <Text style={{ color: '#fff', fontWeight: '800', fontSize: 12 }}>MODO YOUTUBE DIRECTO</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
+    );
+  };
+
+  const renderKickLiveBadge = () => {
+    if (!showPlayerControls || !isKickPlayback(roomData?.video_actual)) return null;
+
+    return (
+      <Animated.View
+        pointerEvents="none"
+        style={{
+          position: 'absolute',
+          top: 12,
+          left: 12,
+          zIndex: 55,
+          opacity: controlsOpacity,
+          flexDirection: 'row',
+          alignItems: 'center',
+          backgroundColor: '#53FC18',
+          paddingHorizontal: 10,
+          paddingVertical: 5,
+          borderRadius: 8,
+        }}
+      >
+        <View
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: 4,
+            backgroundColor: '#000',
+            marginRight: 6,
+          }}
+        />
+        <Text style={{ color: '#000', fontWeight: '900', fontSize: 11, letterSpacing: 1 }}>
+          EN VIVO
+        </Text>
+      </Animated.View>
+    );
+  };
+
+  const renderCenterHostControls = () => {
+    if (!roomData?.video_actual?.id || !showPlayerControls || !isHost) return null;
+
+    const btnCircle = {
+      width: 64,
+      height: 64,
+      borderRadius: 32,
+      backgroundColor: 'rgba(0,0,0,0.55)',
+      borderWidth: 1,
+      borderColor: 'rgba(255,255,255,0.2)',
+      alignItems: 'center',
+      justifyContent: 'center',
+    };
+
+    return (
+      <Animated.View
+        pointerEvents="box-none"
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 52,
+          opacity: controlsOpacity,
+        }}
+      >
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 24 }}>
+          <TouchableOpacity
+            onPress={() => {
+              bumpPlayerControls();
+              togglePlay();
+            }}
+            style={btnCircle}
+            activeOpacity={0.85}
+          >
+            {playing ? (
+              <Pause size={34} color="#fff" fill="#fff" />
+            ) : (
+              <Play size={34} color="#fff" fill="#fff" />
+            )}
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => {
+              bumpPlayerControls();
+              handleSkipNext();
+            }}
+            style={btnCircle}
+            activeOpacity={0.85}
+          >
+            <SkipForward size={30} color="#fff" strokeWidth={2.5} />
+          </TouchableOpacity>
+        </View>
+      </Animated.View>
     );
   };
 
@@ -2200,10 +3124,10 @@ const Room = ({ roomId, user, onLeave }) => {
 
     const guestLocked = !isHost;
 
-    const progressWidth = progressAnim.interpolate({
-      inputRange: [0, 1],
-      outputRange: ['0%', '100%'],
-    });
+    const progressPct =
+      videoDuration > 0
+        ? Math.min(100, (displayTime / videoDuration) * 100)
+        : 0;
 
     return (
       <Animated.View
@@ -2252,26 +3176,21 @@ const Room = ({ roomId, user, onLeave }) => {
             opacity: guestLocked ? 0.55 : 1,
           }}
         >
-          <Animated.View style={{ width: progressWidth, height: '100%', backgroundColor: guestLocked ? '#6b7280' : '#6366f1' }} />
+          <View style={{ width: `${progressPct}%`, height: '100%', backgroundColor: guestLocked ? '#6b7280' : '#6366f1' }} />
         </TouchableOpacity>
 
         <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, opacity: guestLocked ? 0.45 : 1 }}>
-            <TouchableOpacity
-              onPress={() => { bumpPlayerControls(); togglePlay(); }}
-              disabled={guestLocked}
-              style={{ padding: 4 }}
-            >
-              {playing ? (
-                <Pause size={24} color="#fff" fill="#fff" />
-              ) : (
-                <Play size={24} color="#fff" fill="#fff" />
-              )}
-            </TouchableOpacity>
-            <Text style={{ color: '#d4d4d4', fontSize: 11, fontWeight: '600', minWidth: 88 }}>
-              {formatPlayerTime(displayTime)} / {formatPlayerTime(videoDuration)}
-            </Text>
-          </View>
+          <Text
+            style={{
+              color: '#d4d4d4',
+              fontSize: 11,
+              fontWeight: '600',
+              minWidth: 88,
+              opacity: guestLocked ? 0.55 : 1,
+            }}
+          >
+            {formatPlayerTime(displayTime)} / {formatPlayerTime(videoDuration)}
+          </Text>
 
           <TouchableOpacity onPress={() => { bumpPlayerControls(); toggleFullscreen(); }} style={{ padding: 6 }}>
             {isFullscreen ? (
@@ -2361,6 +3280,8 @@ const Room = ({ roomId, user, onLeave }) => {
               style={[StyleSheet.absoluteFillObject, { zIndex: 30 }]}
             />
           )}
+          {renderKickLiveBadge()}
+          {renderCenterHostControls()}
           {renderPlayerControls()}
         </View>
       </View>
@@ -2533,22 +3454,32 @@ const Room = ({ roomId, user, onLeave }) => {
         visible={showMiniBrowser}
         roomId={roomId}
         isHost={isHost}
-        initialUri={roomData?.video_actual?.browserUrl || 'https://duckduckgo.com'}
+        platformId={miniBrowserPlatform}
+        initialUri={
+          miniBrowserPlatform === 'kick'
+            ? 'https://kick.com'
+            : roomData?.video_actual?.browserUrl || 'https://duckduckgo.com'
+        }
         onClose={() => setShowMiniBrowser(false)}
         onAddToQueue={(browserItem) => {
-          const video = {
-            id: 'browser_sync',
-            titulo: browserItem.title || browserItem.url,
-            miniatura: `https://www.google.com/s2/favicons?domain=${browserItem.url}&sz=128`,
-            browserUrl: browserItem.url,
-          };
-          // Misma lógica: si hay algo PLAYING → cola, si no → reproducir directo
-          const isCurrentlyPlaying =
-            roomData?.video_actual?.id &&
-            roomData.video_actual.id !== '' &&
-            roomData.video_actual.state === 'PLAYING';
-          if (isCurrentlyPlaying) {
+          const video = buildBrowserSyncVideo({
+            url: browserItem.url,
+            title: browserItem.title,
+            platformId: browserItem.platformId || miniBrowserPlatform,
+          });
+          if (debeEncolar()) {
+            isAddingToQueueRef.current = true;
             socket.emit('add-to-queue', { roomId, video, username: user?.username });
+            const onKickOrBrowser =
+              roomDataRef.current?.video_actual?.id === 'browser_sync';
+            setTimeout(() => {
+              if (!onKickOrBrowser) {
+                resumeMainPlayback();
+              }
+              setTimeout(() => {
+                isAddingToQueueRef.current = false;
+              }, 1500);
+            }, onKickOrBrowser ? 0 : 350);
           } else {
             socket.emit('change-video', { roomId, video });
           }
@@ -2651,13 +3582,29 @@ const Room = ({ roomId, user, onLeave }) => {
                 <Text style={{ color: '#888', fontSize: 11, marginTop: 1 }}>Busca y reproduce videos</Text>
               </View>
             </TouchableOpacity>
-            <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 14, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)', gap: 14 }} onPress={() => { setShowSourceMenu(false); setShowMiniBrowser(true); }}>
+            <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 14, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)', gap: 14 }} onPress={() => { setShowSourceMenu(false); setMiniBrowserPlatform('browser'); setShowMiniBrowser(true); }}>
               <View style={{ width: 40, height: 40, borderRadius: 12, backgroundColor: '#6366f1', alignItems: 'center', justifyContent: 'center' }}>
                 <Globe size={20} color="#fff" />
               </View>
               <View>
                 <Text style={{ color: '#fff', fontWeight: '800', fontSize: 14 }}>Navegador</Text>
                 <Text style={{ color: '#888', fontSize: 11, marginTop: 1 }}>Cuevana, Netflix y mas</Text>
+              </View>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 14, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)', gap: 14 }}
+              onPress={() => {
+                setShowSourceMenu(false);
+                setMiniBrowserPlatform('kick');
+                setShowMiniBrowser(true);
+              }}
+            >
+              <View style={{ width: 40, height: 40, borderRadius: 12, backgroundColor: '#53FC18', alignItems: 'center', justifyContent: 'center' }}>
+                <Text style={{ color: '#000', fontWeight: '900', fontSize: 16 }}>K</Text>
+              </View>
+              <View>
+                <Text style={{ color: '#fff', fontWeight: '800', fontSize: 14 }}>Kick</Text>
+                <Text style={{ color: '#888', fontSize: 11, marginTop: 1 }}>Streams en vivo por embed</Text>
               </View>
             </TouchableOpacity>
 
