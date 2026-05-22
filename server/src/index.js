@@ -2,42 +2,21 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const NodeCache = require('node-cache');
 require('dotenv').config({ override: true });
-// YtDlpExec dependency removed in favor of youtubei.js
+const {
+  getYoutubeInstance,
+  resolveYoutubeStreamUrl,
+  invalidateStreamCache,
+} = require('./youtubeResolver');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-
-let Innertube;
-let ytInstance = null;
-const streamUrlCache = new NodeCache({ stdTTL: 1800, checkperiod: 300 });
-
 const CDN_FETCH_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
   'Referer': 'https://www.youtube.com/'
 };
-
-async function getYoutubeInstance() {
-  if (!ytInstance) {
-    if (!Innertube) {
-      const module = await import('youtubei.js');
-      Innertube = module.Innertube;
-      const Platform = module.Platform;
-      const vm = require('vm');
-      if (Platform && Platform.shim) {
-        Platform.shim.eval = (code, env) => {
-          const wrappedCode = `(() => { ${code.output} })()`;
-          return vm.runInNewContext(wrappedCode, env);
-        };
-      }
-    }
-    ytInstance = await Innertube.create();
-  }
-  return ytInstance;
-}
 
 app.get('/api/youtube/search', async (req, res) => {
   const query = req.query.q;
@@ -118,35 +97,6 @@ app.get('/api/youtube/info/:videoId', async (req, res) => {
   }
 });
 
-async function resolveYoutubeStreamUrl(videoId) {
-  const cached = streamUrlCache.get(videoId);
-  if (cached) return cached;
-
-  const yt = await getYoutubeInstance();
-  const info = await yt.getInfo(videoId, { client: 'ANDROID' });
-  let format = info.chooseFormat({ type: 'video+audio', quality: 'best' });
-  if (!format || format.has_audio === false) {
-    const combined = (info.streaming_data?.formats || [])
-      .filter((f) => f.has_video && f.has_audio)
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    format = combined[0] || info.chooseFormat({ type: 'video+audio', quality: '360p' });
-  }
-  if (!format) {
-    throw new Error('No se encontró un formato de video+audio adecuado');
-  }
-  if (format.has_audio === false) {
-    throw new Error('El formato obtenido no incluye pista de audio');
-  }
-
-  const streamUrl = await format.decipher(yt.session.player);
-  if (!streamUrl) {
-    throw new Error('No se pudo descifrar URL de stream');
-  }
-
-  streamUrlCache.set(videoId, streamUrl);
-  return streamUrl;
-}
-
 function getPublicBaseUrl(req) {
   if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, '');
   const proto = req.headers['x-forwarded-proto'] || req.protocol;
@@ -173,7 +123,7 @@ const streamWithYoutubeiJs = async (req, res, videoId, json) => {
 
     const response = await fetch(streamUrl, { headers: fetchHeaders });
     if (!response.ok && response.status !== 206) {
-      streamUrlCache.del(videoId);
+      invalidateStreamCache(videoId);
       throw new Error(`Proxy error: ${response.status}`);
     }
 
@@ -220,7 +170,7 @@ const streamWithYoutubeiJs = async (req, res, videoId, json) => {
 app.get('/api/youtube/stream', async (req, res) => {
   const { videoId, json, _retry } = req.query;
   if (!videoId) return res.status(400).json({ error: 'Falta videoId' });
-  if (_retry) streamUrlCache.del(videoId);
+  if (_retry) invalidateStreamCache(videoId);
 
   return streamWithYoutubeiJs(req, res, videoId, json);
 });
