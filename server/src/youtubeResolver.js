@@ -8,19 +8,6 @@ const streamUrlCache = new NodeCache({ stdTTL: 1800, checkperiod: 300 });
 
 const INNERTUBE_CLIENTS = ['IOS', 'MWEB', 'ANDROID', 'WEB', 'TV_EMBEDDED', 'WEB_CREATOR'];
 
-/** Progresivo muxed (video+audio en un solo archivo) — evita pedir itag 18 fijo. */
-const DEFAULT_YTDLP_FORMAT =
-  'best[ext=mp4][vcodec!=none][acodec!=none]/best[ext=mp4]/best[height<=720]/best';
-
-const YTDLP_ATTEMPTS = [
-  { extractorArgs: 'youtube:player_client=android,web', format: DEFAULT_YTDLP_FORMAT },
-  { extractorArgs: 'youtube:player_client=android,web', format: 'b' },
-  { extractorArgs: 'youtube:player_client=ios', format: DEFAULT_YTDLP_FORMAT },
-  { extractorArgs: 'youtube:player_client=ios', format: 'b' },
-  { extractorArgs: 'youtube:player_client=tv_embedded', format: 'best' },
-  { extractorArgs: 'youtube:player_client=mweb', format: 'b' },
-];
-
 const PIPED_API_BASES = (process.env.PIPED_API_URLS || '')
   .split(',')
   .map((s) => s.trim().replace(/\/$/, ''))
@@ -158,41 +145,107 @@ function buildYtDlpBaseOpts() {
   return opts;
 }
 
-async function resolveWithYtDlp(videoId) {
-  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const baseOpts = buildYtDlpBaseOpts();
-  const attempts = YTDLP_ATTEMPTS.map((a) => ({
-    ...baseOpts,
-    dumpSingleJson: true,
-    format: process.env.YOUTUBE_YTDLP_FORMAT || a.format,
-    extractorArgs: a.extractorArgs,
-  }));
+function logCookiesStatus() {
+  const cookiesPath = resolveCookiesPath();
+  if (!cookiesPath) {
+    console.log('🍪 Cookies: no configuradas');
+    return;
+  }
+  try {
+    const content = fs.readFileSync(cookiesPath, 'utf8');
+    const hasYoutube =
+      content.includes('.youtube.com') ||
+      content.includes('youtube.com\t') ||
+      content.includes('youtube.com ');
+    console.log(
+      `🍪 Cookies: ${cookiesPath}, bytes=${content.length}, youtube=${hasYoutube ? 'sí' : 'NO — exporta de nuevo'}`
+    );
+  } catch (e) {
+    console.warn(`🍪 Cookies: no se pudo leer (${e.message})`);
+  }
+}
 
-  if (process.env.YOUTUBE_YTDLP_EXTRACTOR_ARGS) {
-    attempts.unshift({
-      ...baseOpts,
-      dumpSingleJson: true,
-      format: process.env.YOUTUBE_YTDLP_FORMAT || DEFAULT_YTDLP_FORMAT,
-      extractorArgs: process.env.YOUTUBE_YTDLP_EXTRACTOR_ARGS,
+/** Elige URL directa del JSON de yt-dlp sin usar -f (evita "format not available"). */
+function pickUrlFromYtDlpMeta(meta) {
+  if (meta?.url) return { url: meta.url, formatId: meta.format_id, via: 'meta.url' };
+
+  const formats = meta?.formats || [];
+  const combined = formats
+    .filter((f) => f?.url && f.acodec !== 'none' && f.vcodec !== 'none')
+    .sort((a, b) => {
+      const dh = (b.height || 0) - (a.height || 0);
+      if (dh !== 0) return dh;
+      return (b.tbr || b.vbr || 0) - (a.tbr || a.vbr || 0);
     });
+  if (combined[0]?.url) {
+    return { url: combined[0].url, formatId: combined[0].format_id, via: 'formats muxed' };
   }
 
-  const errors = [];
-  console.log(`🎬 Stream yt-dlp: ${videoId} (cookies: ${resolveCookiesPath() ? 'sí' : 'no'})`);
+  const audioOnly = formats
+    .filter((f) => f?.url && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
+    .sort((a, b) => (b.abr || 0) - (a.abr || 0));
+  if (audioOnly[0]?.url) {
+    return { url: audioOnly[0].url, formatId: audioOnly[0].format_id, via: 'audio only' };
+  }
 
-  for (const opts of attempts) {
+  return null;
+}
+
+async function fetchYtDlpJson(watchUrl, extraOpts = {}) {
+  const opts = {
+    ...buildYtDlpBaseOpts(),
+    dumpSingleJson: true,
+    ...extraOpts,
+  };
+  delete opts.format;
+  return youtubedl(watchUrl, opts);
+}
+
+async function resolveWithYtDlp(videoId) {
+  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const errors = [];
+  console.log(`🎬 Stream yt-dlp: ${videoId}`);
+  logCookiesStatus();
+
+  const clientArgs = [
+    process.env.YOUTUBE_YTDLP_EXTRACTOR_ARGS,
+    'youtube:player_client=android,web',
+    'youtube:player_client=ios',
+    'youtube:player_client=tv_embedded',
+    'youtube:player_client=mweb',
+  ].filter(Boolean);
+
+  for (const extractorArgs of clientArgs) {
     try {
-      const meta = await youtubedl(watchUrl, opts);
-      if (!meta?.url) {
-        errors.push(`${opts.extractorArgs}: sin URL`);
+      const meta = await fetchYtDlpJson(watchUrl, { extractorArgs });
+      const picked = pickUrlFromYtDlpMeta(meta);
+      if (!picked?.url) {
+        errors.push(`${extractorArgs}: JSON sin URLs (${meta?.formats?.length || 0} formatos)`);
         continue;
       }
-      console.log(`✅ Stream yt-dlp ${videoId} (${meta.format_id || meta.ext}) [${opts.extractorArgs}]`);
-      return meta.url;
+      console.log(
+        `✅ Stream yt-dlp ${videoId} (${picked.formatId || '?'}) [${extractorArgs}] via ${picked.via}`
+      );
+      return picked.url;
     } catch (err) {
-      const msg = err.stderr?.slice(0, 200) || err.message || String(err);
-      errors.push(msg.replace(/\s+/g, ' ').trim());
-      console.warn(`⚠️ yt-dlp [${opts.extractorArgs}]: ${msg.slice(0, 120)}`);
+      const msg = (err.stderr || err.message || String(err)).replace(/\s+/g, ' ').trim();
+      errors.push(`${extractorArgs}: ${msg.slice(0, 160)}`);
+      console.warn(`⚠️ yt-dlp list [${extractorArgs}]: ${msg.slice(0, 120)}`);
+    }
+  }
+
+  if (process.env.YOUTUBE_YTDLP_FORMAT) {
+    try {
+      const meta = await youtubedl(watchUrl, {
+        ...buildYtDlpBaseOpts(),
+        dumpSingleJson: true,
+        format: process.env.YOUTUBE_YTDLP_FORMAT,
+        extractorArgs: process.env.YOUTUBE_YTDLP_EXTRACTOR_ARGS || 'youtube:player_client=android,web',
+      });
+      const picked = pickUrlFromYtDlpMeta(meta);
+      if (picked?.url) return picked.url;
+    } catch (err) {
+      errors.push(`env format: ${(err.stderr || err.message || '').slice(0, 120)}`);
     }
   }
 
