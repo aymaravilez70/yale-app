@@ -8,11 +8,17 @@ const streamUrlCache = new NodeCache({ stdTTL: 1800, checkperiod: 300 });
 
 const INNERTUBE_CLIENTS = ['IOS', 'MWEB', 'ANDROID', 'WEB', 'TV_EMBEDDED', 'WEB_CREATOR'];
 
+/** Progresivo muxed (video+audio en un solo archivo) — evita pedir itag 18 fijo. */
+const DEFAULT_YTDLP_FORMAT =
+  'best[ext=mp4][vcodec!=none][acodec!=none]/best[ext=mp4]/best[height<=720]/best';
+
 const YTDLP_ATTEMPTS = [
-  { extractorArgs: 'youtube:player_client=android,web', format: '18/b[height<=480]/b' },
-  { extractorArgs: 'youtube:player_client=ios', format: '18/b[height<=480]/b' },
-  { extractorArgs: 'youtube:player_client=tv_embedded', format: 'b[height<=480]/b' },
-  { extractorArgs: 'youtube:player_client=mweb', format: '18/b/b' },
+  { extractorArgs: 'youtube:player_client=android,web', format: DEFAULT_YTDLP_FORMAT },
+  { extractorArgs: 'youtube:player_client=android,web', format: 'b' },
+  { extractorArgs: 'youtube:player_client=ios', format: DEFAULT_YTDLP_FORMAT },
+  { extractorArgs: 'youtube:player_client=ios', format: 'b' },
+  { extractorArgs: 'youtube:player_client=tv_embedded', format: 'best' },
+  { extractorArgs: 'youtube:player_client=mweb', format: 'b' },
 ];
 
 const PIPED_API_BASES = (process.env.PIPED_API_URLS || '')
@@ -166,7 +172,7 @@ async function resolveWithYtDlp(videoId) {
     attempts.unshift({
       ...baseOpts,
       dumpSingleJson: true,
-      format: process.env.YOUTUBE_YTDLP_FORMAT || '18/b[height<=480]/b',
+      format: process.env.YOUTUBE_YTDLP_FORMAT || DEFAULT_YTDLP_FORMAT,
       extractorArgs: process.env.YOUTUBE_YTDLP_EXTRACTOR_ARGS,
     });
   }
