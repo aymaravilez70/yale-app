@@ -1,2 +1,9 @@
 node_modules
 .env
+
+# Scripts y logs de desarrollo (no producción)
+src/test_*.js
+src/print_*.js
+src/*_log.txt
+test_*.js
+*.log
